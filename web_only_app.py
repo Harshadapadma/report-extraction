@@ -292,6 +292,15 @@ from web.pdf_fetcher import (
     fetch_bse_report_list,
     fetch_screener_report_links,
     download_pdf,
+    get_available_presentations,
+)
+
+# Sheets that should be populated from investor presentations rather than
+# (or in addition to) the annual report.  Generic keywords — works for any
+# company template, not just banks.
+_PRESENTATION_SHEET_RE = re.compile(
+    r"operat|asset.?qual|npa|nim|yield|spread|kpi|quarter|metrics?",
+    re.I,
 )
 
 
@@ -746,6 +755,21 @@ with st.sidebar:
     if pdf_mode == "Upload manually":
         manual_pdf = st.file_uploader("Upload Annual Report PDF", type=["pdf"])
 
+    st.markdown("---")
+    st.header("📊 Investor Presentation")
+    st.caption("Operating metrics & asset quality — sourced from quarterly investor decks.")
+    pres_mode = st.radio(
+        "Presentation source",
+        ["Auto-download from NSE/BSE", "Upload manually", "Skip"],
+        key="pres_mode",
+        help="Investor presentations contain operating metrics, NIM, yields, asset quality data.",
+    )
+    manual_pres_pdf = None
+    if pres_mode == "Upload manually":
+        manual_pres_pdf = st.file_uploader(
+            "Upload Investor Presentation PDF", type=["pdf"], key="pres_upload"
+        )
+
     run_btn = st.button("🚀 Run Full Pipeline", type="primary", use_container_width=True)
 
 
@@ -871,6 +895,46 @@ if run_btn:
             status.info("📄 Step 3 / 5 — Skipping PDF (web-only mode).")
             progress.progress(35)
 
+        # ── 3b. Get / download investor presentation ──────────────────────────
+        pres_bytes: Optional[bytes] = None
+        pres_label = ""
+
+        if pres_mode == "Upload manually" and manual_pres_pdf:
+            manual_pres_pdf.seek(0)
+            pres_bytes = manual_pres_pdf.read()
+            pres_label = manual_pres_pdf.name
+
+        elif pres_mode == "Auto-download from NSE/BSE":
+            status.info("📊 Step 3b — Finding investor presentations on NSE/BSE…")
+            progress.progress(32, text="Fetching presentation list…")
+
+            presentations = get_available_presentations(nse_symbol, bse_code or None)
+
+            if not presentations:
+                st.info("ℹ️ No investor presentations found on NSE/BSE — presentation sheets will use annual report only.")
+            else:
+                st.success(f"📊 Found {len(presentations)} investor presentation(s)")
+                pres_options = {
+                    f"{p.get('year', '?')} — {p.get('filename', 'presentation.pdf')} [{p.get('source', '')}]": p
+                    for p in presentations[:10]   # cap dropdown to 10 most recent
+                }
+                selected_pres_label = st.selectbox(
+                    "Select investor presentation to use:",
+                    list(pres_options.keys()),
+                    key="pres_select",
+                )
+                selected_pres = pres_options[selected_pres_label]
+
+                pres_dl_status = st.empty()
+                pres_dl_status.info(f"⬇️ Downloading **{selected_pres['filename']}**…")
+                pres_bytes = download_pdf(selected_pres["url"])
+                if pres_bytes:
+                    pres_label = selected_pres["filename"]
+                    size_mb    = len(pres_bytes) / 1_048_576
+                    pres_dl_status.success(f"✅ Downloaded **{pres_label}** ({size_mb:.1f} MB)")
+                else:
+                    pres_dl_status.warning("⚠️ Presentation download failed — skipping.")
+
         # ── 4. Extract PDF data (tables + raw text) ───────────────────────────
         pdf_data: dict = {}
         pdf_text: str  = ""
@@ -923,6 +987,16 @@ if run_btn:
             status.info("📄 Step 4 / 5 — No PDF available, using web data only.")
             progress.progress(60)
 
+        # ── 4b. Extract investor presentation text ────────────────────────────
+        pres_text: str = ""
+        if pres_bytes:
+            progress.progress(58, text="Extracting investor presentation text…")
+            with st.spinner(f"Extracting text from **{pres_label}**…"):
+                pres_text = extract_pdf_text_for_llm(pres_bytes, max_chars_per_page=4000)
+            st.metric("Presentation text chars", f"{len(pres_text):,}")
+            with st.expander("📊 Investor presentation text (sample)"):
+                st.text(pres_text[:2000] + ("…" if len(pres_text) > 2000 else ""))
+
         # ── 5. LLM maps everything → template ─────────────────────────────────
         status.info("🧠 Step 5 / 5 — LLM matching all data to template labels…")
         progress.progress(65, text="LLM field mapping…")
@@ -934,6 +1008,19 @@ if run_btn:
             pct = 65 + int((i / len(sheets_data)) * 22)
             progress.progress(pct, text=f"LLM: mapping '{sheet_name}'…")
 
+            # Route: presentation-type sheets (Operating Metrics, Asset Quality,
+            # NPA, KPI, etc.) get the investor presentation text as primary
+            # context; annual-report sheets get the annual report PDF text.
+            # If both are available, presentation sheets also get the AR text
+            # appended so ratio cross-checks remain possible.
+            if _PRESENTATION_SHEET_RE.search(sheet_name) and pres_text:
+                effective_pdf_text = pres_text
+                if pdf_text:
+                    # Append a trimmed slice of the AR text for context
+                    effective_pdf_text += "\n\n=== ANNUAL REPORT SUPPLEMENT ===\n" + pdf_text[:6000]
+            else:
+                effective_pdf_text = pdf_text
+
             sheet_filled = llm_map_fields(
                 sheet_name=sheet_name,
                 template_labels=sheet_data["labels"],
@@ -943,7 +1030,7 @@ if run_btn:
                 pdf_data=pdf_data,
                 client=client,
                 model=api_model,
-                pdf_text=pdf_text,
+                pdf_text=effective_pdf_text,
             )
 
             n = sum(1 for yv in sheet_filled.values() for v in yv.values() if v is not None)
@@ -972,9 +1059,10 @@ if run_btn:
 
         # Sources banner
         sources = []
-        if s_count:      sources.append("Screener.in")
-        if y_count:      sources.append("yfinance")
-        if pdf_field_count: sources.append(f"PDF ({pdf_label})")
+        if s_count:         sources.append("Screener.in")
+        if y_count:         sources.append("yfinance")
+        if pdf_field_count: sources.append(f"Annual Report ({pdf_label})")
+        if pres_text:       sources.append(f"Investor Presentation ({pres_label})")
 
         status.success(
             f"✅ Done! **{stats['written']}** cells written · "

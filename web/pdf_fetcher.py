@@ -497,6 +497,180 @@ def download_pdf(url: str, progress_cb=None) -> Optional[bytes]:
     return None
 
 
+# ── Investor Presentation helpers ────────────────────────────────────────────
+
+# Patterns that positively identify investor / analyst presentations.
+_PRESENTATION_CONFIRM = re.compile(
+    r"investor.?present|analyst.?day|investor.?day|investor.?meet"
+    r"|investor.?brief|investor.?update|corporate.?present"
+    r"|fact.?sheet|investor.?deck|quarterly.?update"
+    r"|q[1-4].?fy\d{2}|fy\d{2}.?q[1-4]",          # quarterly investor docs
+    re.I,
+)
+
+
+def _is_investor_presentation(filename: str, link_text: str = "") -> bool:
+    """Return True if the document looks like an investor/analyst presentation."""
+    combined = f"{filename} {link_text}"
+    return bool(_PRESENTATION_CONFIRM.search(combined))
+
+
+def fetch_nse_presentation_list(symbol: str) -> list[dict]:
+    """
+    Fetch list of investor presentations from NSE for a given symbol.
+
+    Uses the same NSE annual-reports endpoint, but selects records whose
+    filename / description matches presentation patterns — the inverse of
+    what fetch_nse_report_list does.
+
+    Returns list of dicts:
+        {
+          "year":     "F2025",
+          "filename": "HDFCBANK_Investor_Presentation_Q4FY25.pdf",
+          "url":      "https://...",
+          "size_mb":  3.2,
+          "source":   "NSE",
+        }
+    Sorted newest-first.
+    """
+    session = _nse_session.get()
+    url     = f"{_NSE_API}/annual-reports"
+    params  = {"index": "equities", "symbol": symbol.upper()}
+
+    try:
+        resp = session.get(url, params=params, headers=_API_HEADERS, timeout=_TIMEOUT)
+        if resp.status_code in (403, 404):
+            logger.info(f"pdf_fetcher: NSE presentations endpoint returned {resp.status_code} for {symbol}")
+            return []
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        logger.warning(f"pdf_fetcher: NSE presentation list failed for {symbol}: {e}")
+        return []
+
+    records = data if isinstance(data, list) else data.get("data", [])
+    if not isinstance(records, list):
+        return []
+
+    results = []
+    for rec in records:
+        link = (
+            rec.get("pdfLink") or rec.get("fileName") or
+            rec.get("downloadLink") or rec.get("attachmentURL") or ""
+        )
+        if not link:
+            continue
+
+        if link.startswith("/"):
+            link = f"https://www.nseindia.com{link}"
+        if not link.startswith("http"):
+            link = f"https://www.nseindia.com/{link}"
+
+        from_date  = rec.get("fromDate", "") or rec.get("startDate", "") or ""
+        to_date    = rec.get("toDate",   "") or rec.get("endDate",   "") or ""
+        year_label = _infer_fy_from_dates(from_date, to_date) or _infer_fy_from_text(link)
+        filename   = link.split("/")[-1].split("?")[0] or f"{symbol}_presentation.pdf"
+        link_text  = rec.get("subject", "") or rec.get("description", "") or ""
+
+        try:
+            size_bytes = int(rec.get("fileSize", 0) or 0)
+            size_mb    = round(size_bytes / 1_048_576, 1) if size_bytes else 0
+        except (TypeError, ValueError):
+            size_mb = 0
+
+        if not _is_investor_presentation(filename, link_text):
+            logger.debug(f"pdf_fetcher: NSE skip non-presentation: {filename}")
+            continue
+
+        results.append({
+            "year":     year_label,
+            "filename": filename,
+            "url":      link,
+            "size_mb":  size_mb,
+            "source":   "NSE",
+        })
+
+    results.sort(key=lambda r: r["year"] or "", reverse=True)
+    return results
+
+
+def fetch_bse_presentation_list(bse_code: str) -> list[dict]:
+    """
+    Fetch investor presentation list from BSE using type=PRESN.
+
+    BSE separates presentations (PRESN) from annual reports (AR) in the same
+    corporate filings API — so we just change the type parameter.
+    """
+    requests = _get_requests()
+    url = "https://api.bseindia.com/BseIndiaAPI/api/AnnualReport/w"
+    params = {"scripcode": bse_code, "type": "PRESN"}
+    bse_headers = {
+        **_HEADERS,
+        "Referer": "https://www.bseindia.com/",
+        "Origin":  "https://www.bseindia.com",
+    }
+
+    try:
+        resp = requests.get(url, params=params, headers=bse_headers, timeout=_TIMEOUT)
+        if resp.status_code in (403, 404):
+            return []
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        logger.warning(f"pdf_fetcher: BSE presentation list failed for {bse_code}: {e}")
+        return []
+
+    records = data if isinstance(data, list) else data.get("Table", data.get("data", []))
+    if not isinstance(records, list):
+        return []
+
+    results = []
+    for rec in records:
+        link = rec.get("PDFLINKURL") or rec.get("pdfLink") or rec.get("URL") or ""
+        if not link:
+            continue
+        if link.startswith("/"):
+            link = f"https://www.bseindia.com{link}"
+
+        year_text  = rec.get("YEAR") or rec.get("year") or rec.get("Period") or ""
+        year_label = _infer_fy_from_text(str(year_text)) or _infer_fy_from_text(link)
+        filename   = link.split("/")[-1].split("?")[0] or f"bse_{bse_code}_presentation.pdf"
+
+        results.append({
+            "year":     year_label,
+            "filename": filename,
+            "url":      link,
+            "size_mb":  0,
+            "source":   "BSE",
+        })
+
+    results.sort(key=lambda r: r["year"] or "", reverse=True)
+    return results
+
+
+def get_available_presentations(symbol: str, bse_code: Optional[str] = None) -> list[dict]:
+    """
+    Return all available investor presentation links from NSE + BSE,
+    deduplicated by URL and sorted newest-first.
+    """
+    seen_urls: set[str] = set()
+    all_pres: list[dict] = []
+
+    for rep in fetch_nse_presentation_list(symbol):
+        if rep["url"] not in seen_urls:
+            all_pres.append(rep)
+            seen_urls.add(rep["url"])
+
+    if bse_code:
+        for rep in fetch_bse_presentation_list(bse_code):
+            if rep["url"] not in seen_urls:
+                all_pres.append(rep)
+                seen_urls.add(rep["url"])
+
+    all_pres.sort(key=lambda r: r.get("year") or "", reverse=True)
+    return all_pres
+
+
 # ── Convenience: get best available report for a given FY ────────────────────
 
 def get_report_for_year(
