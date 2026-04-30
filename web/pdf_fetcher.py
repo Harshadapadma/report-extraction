@@ -13,6 +13,7 @@ Returns the raw PDF bytes so the caller can pipe them into pdfplumber / pdf_pars
 
 from __future__ import annotations
 
+import io
 import re
 import time
 from datetime import date
@@ -140,12 +141,18 @@ class _SimpleSession:
         if self._session is None or (now - self._refreshed) > 1800:
             s = requests.Session()
             try:
-                r = s.get(_NSE_HOME, headers=_HEADERS, timeout=_TIMEOUT)
+                r = s.get(_NSE_HOME, headers=_HEADERS, timeout=(8, 15))
                 r.raise_for_status()
-                s.get(
+                # Visit relevant pages to get the right cookies for each API
+                for warm_url in [
                     f"{_NSE_HOME}/companies-listing/corporate-filings-annual-reports",
-                    headers=_HEADERS, timeout=_TIMEOUT,
-                )
+                    f"{_NSE_HOME}/companies-listing/corporate-filings-announcements",
+                    f"{_NSE_HOME}/companies-listing/corporate-filings-financial-results",
+                ]:
+                    try:
+                        s.get(warm_url, headers=_HEADERS, timeout=(8, 15))
+                    except Exception:
+                        pass
                 self._session  = s
                 self._refreshed = now
                 logger.debug("pdf_fetcher: NSE session bootstrapped")
@@ -445,9 +452,13 @@ def download_pdf(url: str, progress_cb=None) -> Optional[bytes]:
         data = b"".join(chunks)
         return data if data.startswith(b"%PDF") else None
 
+    # Per-strategy connect+read timeouts (connect_timeout, read_timeout).
+    # Using a tuple prevents hanging when server accepts connection but never sends data.
+    _DL_TIMEOUT = (10, 45)   # 10s to connect, 45s to read — total max ~55s per strategy
+
     # ── Strategy 1: direct request (no session) ────────────────────────────────
     try:
-        resp = requests.get(url, headers=_HEADERS, timeout=60, stream=True)
+        resp = requests.get(url, headers=_HEADERS, timeout=_DL_TIMEOUT, stream=True)
         if resp.status_code == 200:
             data = _stream(resp)
             if data:
@@ -459,20 +470,11 @@ def download_pdf(url: str, progress_cb=None) -> Optional[bytes]:
     # ── Strategy 2: NSE session (cookie-bootstrapped) ─────────────────────────
     try:
         session = _nse_session.get()
-        resp = session.get(url, headers=_API_HEADERS, timeout=60, stream=True)
+        resp = session.get(url, headers=_API_HEADERS, timeout=_DL_TIMEOUT, stream=True)
         if resp.status_code == 200:
             data = _stream(resp)
             if data:
                 logger.info(f"pdf_fetcher: ✓ NSE-session  {len(data)/1_048_576:.1f} MB  {url[:80]}")
-                return data
-        # Force session refresh and retry once
-        _nse_session._session = None
-        session = _nse_session.get()
-        resp = session.get(url, headers=_API_HEADERS, timeout=60, stream=True)
-        if resp.status_code == 200:
-            data = _stream(resp)
-            if data:
-                logger.info(f"pdf_fetcher: ✓ NSE-refresh  {len(data)/1_048_576:.1f} MB  {url[:80]}")
                 return data
     except Exception as e:
         logger.debug(f"pdf_fetcher: strategy 2 failed: {e}")
@@ -484,7 +486,7 @@ def download_pdf(url: str, progress_cb=None) -> Optional[bytes]:
             "Referer": "https://www.bseindia.com/",
             "Origin":  "https://www.bseindia.com",
         }
-        resp = requests.get(url, headers=bse_headers, timeout=60, stream=True)
+        resp = requests.get(url, headers=bse_headers, timeout=_DL_TIMEOUT, stream=True)
         if resp.status_code == 200:
             data = _stream(resp)
             if data:
@@ -516,16 +518,16 @@ def _is_investor_presentation(filename: str, link_text: str = "") -> bool:
 
 def fetch_nse_presentation_list(symbol: str) -> list[dict]:
     """
-    Fetch list of investor presentations from NSE for a given symbol.
+    Fetch list of investor presentations from NSE Corporate Announcements API.
 
-    Uses the same NSE annual-reports endpoint, but selects records whose
-    filename / description matches presentation patterns — the inverse of
-    what fetch_nse_report_list does.
+    NSE's Corporate Announcements tab is where companies file investor
+    presentations.  We query the announcements endpoint and filter by
+    subject keywords matching "Investor Presentation".
 
     Returns list of dicts:
         {
           "year":     "F2025",
-          "filename": "HDFCBANK_Investor_Presentation_Q4FY25.pdf",
+          "filename": "EQUITASBNK_InvestorPresentation_Q4FY25.pdf",
           "url":      "https://...",
           "size_mb":  3.2,
           "source":   "NSE",
@@ -533,18 +535,21 @@ def fetch_nse_presentation_list(symbol: str) -> list[dict]:
     Sorted newest-first.
     """
     session = _nse_session.get()
-    url     = f"{_NSE_API}/annual-reports"
-    params  = {"index": "equities", "symbol": symbol.upper()}
+
+    # NSE Corporate Announcements API — returns all corporate announcements
+    # (results, presentations, boardmeeting notices, etc.) for a symbol.
+    url    = f"{_NSE_API}/corporate-announcements"
+    params = {"index": "equities", "symbol": symbol.upper()}
 
     try:
         resp = session.get(url, params=params, headers=_API_HEADERS, timeout=_TIMEOUT)
         if resp.status_code in (403, 404):
-            logger.info(f"pdf_fetcher: NSE presentations endpoint returned {resp.status_code} for {symbol}")
+            logger.info(f"pdf_fetcher: NSE corporate-announcements returned {resp.status_code} for {symbol}")
             return []
         resp.raise_for_status()
         data = resp.json()
     except Exception as e:
-        logger.warning(f"pdf_fetcher: NSE presentation list failed for {symbol}: {e}")
+        logger.warning(f"pdf_fetcher: NSE corporate-announcements failed for {symbol}: {e}")
         return []
 
     records = data if isinstance(data, list) else data.get("data", [])
@@ -553,43 +558,43 @@ def fetch_nse_presentation_list(symbol: str) -> list[dict]:
 
     results = []
     for rec in records:
+        # Subject field identifies the filing type
+        subject   = rec.get("subject", "") or rec.get("desc", "") or ""
+        link_text = subject
+
+        # Only take records whose subject matches investor presentation patterns
+        if not _is_investor_presentation("", subject):
+            continue
+
+        # Attachment file — the actual PDF URL
         link = (
-            rec.get("pdfLink") or rec.get("fileName") or
-            rec.get("downloadLink") or rec.get("attachmentURL") or ""
+            rec.get("attchmntFile") or rec.get("pdfLink") or
+            rec.get("attachmentURL") or rec.get("fileName") or ""
         )
         if not link:
             continue
 
         if link.startswith("/"):
             link = f"https://www.nseindia.com{link}"
-        if not link.startswith("http"):
-            link = f"https://www.nseindia.com/{link}"
+        elif not link.startswith("http"):
+            link = f"https://nsearchives.nseindia.com/{link.lstrip('/')}"
 
-        from_date  = rec.get("fromDate", "") or rec.get("startDate", "") or ""
-        to_date    = rec.get("toDate",   "") or rec.get("endDate",   "") or ""
-        year_label = _infer_fy_from_dates(from_date, to_date) or _infer_fy_from_text(link)
-        filename   = link.split("/")[-1].split("?")[0] or f"{symbol}_presentation.pdf"
-        link_text  = rec.get("subject", "") or rec.get("description", "") or ""
-
-        try:
-            size_bytes = int(rec.get("fileSize", 0) or 0)
-            size_mb    = round(size_bytes / 1_048_576, 1) if size_bytes else 0
-        except (TypeError, ValueError):
-            size_mb = 0
-
-        if not _is_investor_presentation(filename, link_text):
-            logger.debug(f"pdf_fetcher: NSE skip non-presentation: {filename}")
-            continue
+        # Date of broadcast
+        bcast_dt  = rec.get("bcastDt") or rec.get("exchdisstime") or ""
+        year_label = _infer_fy_from_text(subject) or _infer_fy_from_text(link) or _infer_fy_from_text(str(bcast_dt))
+        filename   = link.split("/")[-1].split("?")[0] or f"{symbol}_investor_presentation.pdf"
 
         results.append({
             "year":     year_label,
             "filename": filename,
             "url":      link,
-            "size_mb":  size_mb,
+            "size_mb":  0,
             "source":   "NSE",
+            "desc":     subject,
         })
 
     results.sort(key=lambda r: r["year"] or "", reverse=True)
+    logger.info(f"pdf_fetcher: NSE corporate-announcements found {len(results)} presentations for {symbol}")
     return results
 
 
@@ -722,13 +727,25 @@ def _get_company_website(symbol: str, bse_code: Optional[str] = None) -> Optiona
     # ── 1. yfinance — works from cloud/server IPs, no scraping needed ─────────
     try:
         import yfinance as yf
-        for suffix in (".NS", ".BO", ""):
-            ticker_sym = symbol.upper() + suffix
-            info = yf.Ticker(ticker_sym).info
-            site = info.get("website") or info.get("companyOfficialSite")
-            if site and site.startswith("http"):
-                logger.info(f"pdf_fetcher: company website from yfinance ({ticker_sym}): {site}")
-                return _cache_and_return(site.rstrip("/"))
+        from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutTimeout
+
+        def _yf_website():
+            for suffix in (".NS", ".BO"):
+                info = yf.Ticker(symbol.upper() + suffix).info
+                site = info.get("website") or info.get("companyOfficialSite")
+                if site and site.startswith("http"):
+                    return site
+            return None
+
+        with ThreadPoolExecutor(max_workers=1) as ex:
+            fut = ex.submit(_yf_website)
+            try:
+                site = fut.result(timeout=15)
+                if site:
+                    logger.info(f"pdf_fetcher: company website from yfinance: {site}")
+                    return _cache_and_return(site.rstrip("/"))
+            except FutTimeout:
+                logger.debug("pdf_fetcher: yfinance website lookup timed out")
     except Exception as e:
         logger.debug(f"pdf_fetcher: yfinance website lookup failed: {e}")
 
@@ -891,39 +908,37 @@ def get_available_presentations(symbol: str, bse_code: Optional[str] = None) -> 
     Return all available investor presentation links, newest-first.
 
     Sources tried in order:
-      1. NSE corporate filings  (same endpoint as annual-reports, filtered for presentations)
-      2. BSE PRESN filings      (BSE type=PRESN category)
-      3. Company IR website     (generic scraper — most reliable for recent quarterly decks)
+      1. NSE Corporate Announcements API  (dedicated presentations tab)
+      2. BSE PRESN filings               (BSE type=PRESN category)
+      3. Company IR website              (generic scraper — most reliable for recent quarterly decks)
     """
     seen_urls: set[str] = set()
     all_pres: list[dict] = []
 
+    # 1. NSE Corporate Announcements (primary — the correct NSE tab for presentations)
     for rep in fetch_nse_presentation_list(symbol):
-        if rep["url"] not in seen_urls:
+        url = rep["url"]
+        if url and url not in seen_urls:
             all_pres.append(rep)
-            seen_urls.add(rep["url"])
+            seen_urls.add(url)
 
+    # 2. BSE PRESN category
     if bse_code:
         for rep in fetch_bse_presentation_list(bse_code):
-            if rep["url"] not in seen_urls:
+            url = rep["url"]
+            if url and url not in seen_urls:
                 all_pres.append(rep)
-                seen_urls.add(rep["url"])
+                seen_urls.add(url)
 
-    # If exchange filing search found nothing, try scraping the company's own IR page
-    if not all_pres:
-        logger.info(f"pdf_fetcher: exchange presentation search returned 0 — trying company IR page")
-        for rep in fetch_company_ir_presentations(symbol, bse_code):
-            if rep["url"] not in seen_urls:
-                all_pres.append(rep)
-                seen_urls.add(rep["url"])
-    else:
-        # Even if exchange search found something, supplement with IR page
-        for rep in fetch_company_ir_presentations(symbol, bse_code):
-            if rep["url"] not in seen_urls:
-                all_pres.append(rep)
-                seen_urls.add(rep["url"])
+    # 3. Company's own IR page — always try; often has the most recent quarterly deck
+    for rep in fetch_company_ir_presentations(symbol, bse_code):
+        url = rep["url"]
+        if url and url not in seen_urls:
+            all_pres.append(rep)
+            seen_urls.add(url)
 
     all_pres.sort(key=lambda r: r.get("year") or "", reverse=True)
+    logger.info(f"pdf_fetcher: total presentations found for {symbol}: {len(all_pres)}")
     return all_pres
 
 
@@ -1007,8 +1022,11 @@ def _infer_quarter(text: str) -> Optional[str]:
 
 def fetch_nse_quarterly_result_pdfs(symbol: str) -> list[dict]:
     """
-    Fetch quarterly result PDF links from NSE's financial-results API.
-    NSE returns one record per quarter; each record includes pdfLink.
+    Fetch quarterly result PDF + XBRL links from NSE's financial-results API.
+
+    NSE's Financial Results tab has one record per quarter with both a PDF
+    link (human-readable filing) and an XBRL XML link (machine-readable).
+    We capture both so callers can prefer XBRL when available.
 
     Returns list of dicts:
         {
@@ -1016,7 +1034,8 @@ def fetch_nse_quarterly_result_pdfs(symbol: str) -> list[dict]:
           "quarter":   "Q4",       # Q1/Q2/Q3/Q4
           "is_annual": True,       # True only for Q4 (full-year figures included)
           "filename":  "EQUITASBNK_Q4FY25_Results.pdf",
-          "url":       "https://...",
+          "url":       "https://...",   # PDF link
+          "xbrl_url":  "https://...",   # XBRL XML link (may be None)
           "source":    "NSE",
         }
     Sorted newest-first.
@@ -1039,36 +1058,55 @@ def fetch_nse_quarterly_result_pdfs(symbol: str) -> list[dict]:
     if not isinstance(records, list):
         return []
 
+    def _abs(link: str) -> str:
+        if not link:
+            return ""
+        if link.startswith("/"):
+            return f"https://www.nseindia.com{link}"
+        if not link.startswith("http"):
+            return f"https://nsearchives.nseindia.com/{link.lstrip('/')}"
+        return link
+
     results = []
     for rec in records:
-        # PDF link field names vary across NSE API versions
-        link = (
-            rec.get("pdfLink") or rec.get("xbrlLink") or
-            rec.get("attachmentURL") or rec.get("fileName") or ""
+        # ── PDF link (primary, human-readable filing) ──────────────────────────
+        pdf_link = _abs(
+            rec.get("pdfLink") or rec.get("attachmentURL") or
+            rec.get("fileName") or rec.get("pdfname") or ""
         )
-        if not link:
-            continue
-        if link.startswith("/"):
-            link = f"https://www.nseindia.com{link}"
-        if not link.startswith("http"):
-            link = f"https://www.nseindia.com/{link}"
 
-        period    = rec.get("period") or rec.get("toDate") or rec.get("periodEnded") or ""
-        year_label = _infer_fy_from_dates("", str(period)) or _infer_fy_from_text(str(period))
-        quarter    = _infer_quarter(str(period))
-        filename   = link.split("/")[-1].split("?")[0] or f"{symbol}_quarterly_result.pdf"
+        # ── XBRL link (machine-readable structured data) ───────────────────────
+        xbrl_link = _abs(
+            rec.get("xbrlLink") or rec.get("xbrl") or
+            rec.get("xbrlFile") or rec.get("xbrlName") or ""
+        )
+
+        # Need at least one of PDF or XBRL
+        if not pdf_link and not xbrl_link:
+            continue
+
+        # Period / date fields
+        period     = rec.get("period") or rec.get("toDate") or rec.get("periodEnded") or ""
+        to_date    = rec.get("toDate") or ""
+        year_label = _infer_fy_from_dates("", str(to_date)) or _infer_fy_from_text(str(period))
+        quarter    = _infer_quarter(str(period)) or _infer_quarter(str(to_date))
+
+        primary_link = pdf_link or xbrl_link
+        filename     = primary_link.split("/")[-1].split("?")[0] or f"{symbol}_quarterly_result.pdf"
 
         results.append({
             "year":      year_label,
             "quarter":   quarter,
             "is_annual": quarter == "Q4",
             "filename":  filename,
-            "url":       link,
+            "url":       primary_link,
+            "xbrl_url":  xbrl_link if xbrl_link != primary_link else None,
             "size_mb":   0,
             "source":    "NSE",
         })
 
     results.sort(key=lambda r: (r["year"] or "", r["quarter"] or ""), reverse=True)
+    logger.info(f"pdf_fetcher: NSE financial-results found {len(results)} quarterly results for {symbol}")
     return results
 
 
@@ -1139,6 +1177,84 @@ def fetch_bse_quarterly_result_pdfs(bse_code: str) -> list[dict]:
             break   # consolidated found — skip standalone
 
     results.sort(key=lambda r: (r["year"] or "", r["quarter"] or ""), reverse=True)
+    return results
+
+
+def fetch_company_annual_reports(
+    symbol: str,
+    bse_code: Optional[str] = None,
+) -> list[dict]:
+    """
+    Scrape annual report PDF links from the company's own IR page.
+    Used as a fallback when NSE/BSE/Screener don't have the report.
+
+    Returns same dict format as other fetchers:
+      {year, filename, url, size_mb, source}
+    """
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        return []
+
+    requests = _get_requests()
+
+    company_site = _get_company_website(symbol, bse_code)
+    if not company_site:
+        return []
+
+    _AR_IR_PATHS = [
+        "/investor-relations/annual-reports",
+        "/investor-relations/annual-report",
+        "/investors/annual-reports",
+        "/investors/annual-report",
+        "/ir/annual-reports",
+        "/annual-reports",
+        "/annual-report",
+        "/investor-relations",
+        "/investors",
+        "/ir",
+    ]
+
+    seen_urls: set[str] = set()
+    results: list[dict] = []
+
+    for path in _AR_IR_PATHS:
+        page_url = f"{company_site}{path}"
+        try:
+            resp = requests.get(page_url, headers=_HEADERS, timeout=_TIMEOUT)
+            if resp.status_code not in (200, 301, 302):
+                continue
+            soup = BeautifulSoup(resp.text, "html.parser")
+            for a in soup.find_all("a", href=True):
+                href = a["href"].strip()
+                link_text = a.get_text(" ", strip=True)
+                if not href.lower().endswith(".pdf"):
+                    continue
+                if href.startswith("//"):
+                    href = "https:" + href
+                elif href.startswith("/"):
+                    href = company_site + href
+                elif not href.startswith("http"):
+                    continue
+                if href in seen_urls:
+                    continue
+                if not _is_annual_report(href.split("/")[-1], link_text):
+                    continue
+                year = _infer_fy_from_text(href.split("/")[-1] + " " + link_text)
+                seen_urls.add(href)
+                results.append({
+                    "year":     year,
+                    "filename": href.split("/")[-1],
+                    "url":      href,
+                    "size_mb":  None,
+                    "source":   "company_ir",
+                })
+                logger.info(f"pdf_fetcher: company IR annual report [{year}]: {href}")
+        except Exception as e:
+            logger.debug(f"pdf_fetcher: company IR annual report scrape failed at {page_url}: {e}")
+            continue
+
+    results.sort(key=lambda r: r["year"] or "", reverse=True)
     return results
 
 
@@ -1487,6 +1603,14 @@ def get_report_for_year(
         if rep["year"] == fy_label:
             logger.info(f"pdf_fetcher: found {fy_label} report on Screener: {rep['filename']}")
             return rep
+
+    # Final fallback: company's own IR page
+    if bse_code:
+        company_reports = fetch_company_annual_reports(symbol, bse_code)
+        for rep in company_reports:
+            if rep["year"] == fy_label:
+                logger.info(f"pdf_fetcher: found {fy_label} report on company IR: {rep['filename']}")
+                return rep
 
     logger.info(f"pdf_fetcher: no report found for {symbol} {fy_label}")
     return None

@@ -241,48 +241,57 @@ def fetch_screener_raw(symbol: str, consolidated: bool = True) -> dict:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def fetch_yfinance_raw(symbol: str, years: list[str]) -> dict:
-    try:
+    """Fetch yfinance data with a hard 20-second timeout to prevent hanging."""
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
+
+    def _fetch():
         tk = yf.Ticker(f"{symbol.upper()}.NS")
-    except Exception:
-        return {}
-
-    year_set = set(years)
-    _CRORE   = 1e7
-    result   = {}
-
-    for sec_name, attr in [
-        ("Income Statement", "income_stmt"),
-        ("Balance Sheet",    "balance_sheet"),
-        ("Cash Flow",        "cashflow"),
-    ]:
-        try:
-            df = getattr(tk, attr)
-            if df is None or df.empty:
-                continue
-            sec: dict[str, dict[str, float]] = {}
-            for col in df.columns:
-                try:
-                    yr_label = f"F{col.year if col.month <= 3 else col.year + 1}"
-                except AttributeError:
+        year_set = set(years)
+        _CRORE   = 1e7
+        result   = {}
+        for sec_name, attr in [
+            ("Income Statement", "income_stmt"),
+            ("Balance Sheet",    "balance_sheet"),
+            ("Cash Flow",        "cashflow"),
+        ]:
+            try:
+                df = getattr(tk, attr)
+                if df is None or df.empty:
                     continue
-                if yr_label not in year_set:
-                    continue
-                vals = {}
-                for metric in df.index:
+                sec: dict[str, dict[str, float]] = {}
+                for col in df.columns:
                     try:
-                        v = float(df.loc[metric, col])
-                        if v == v:
-                            vals[str(metric)] = round(v / _CRORE, 4)
-                    except Exception:
-                        pass
-                if vals:
-                    sec[yr_label] = vals
-            if sec:
-                result[sec_name] = sec
-        except Exception:
-            pass
+                        yr_label = f"F{col.year if col.month <= 3 else col.year + 1}"
+                    except AttributeError:
+                        continue
+                    if yr_label not in year_set:
+                        continue
+                    vals = {}
+                    for metric in df.index:
+                        try:
+                            v = float(df.loc[metric, col])
+                            if v == v:
+                                vals[str(metric)] = round(v / _CRORE, 4)
+                        except Exception:
+                            pass
+                    if vals:
+                        sec[yr_label] = vals
+                if sec:
+                    result[sec_name] = sec
+            except Exception:
+                pass
+        return result
 
-    return result
+    try:
+        with ThreadPoolExecutor(max_workers=1) as ex:
+            fut = ex.submit(_fetch)
+            return fut.result(timeout=20)
+    except FuturesTimeout:
+        logger.warning(f"yfinance: timed out after 20s for {symbol} — skipping")
+        return {}
+    except Exception as e:
+        logger.warning(f"yfinance: failed for {symbol} — {e}")
+        return {}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -308,16 +317,11 @@ from web.base import CompanyIdentifier
 
 def fetch_exchange_raw(symbol: str, bse_code: Optional[str], years: list[str]) -> dict:
     """
-    Fetch structured financial data from NSE and BSE quarterly results APIs.
-    Returns the same format as fetch_screener_raw so it can be merged in the
-    LLM prompt:
-      {
-        "P&L":           {"years": [...], "data": {"Revenue...": {"F2025": 1234, ...}}},
-        "Balance Sheet": {...},
-        ...
-      }
-    Data quality: HIGHER than Screener — directly from exchange XBRL submissions.
+    Fetch structured financial data from NSE/BSE/Tickertape in parallel.
+    Each connector runs in its own thread with a 25-second timeout so a
+    slow or hung source never blocks the whole pipeline.
     """
+    from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FutTimeout
     from web.base import WebDataResult
 
     company = CompanyIdentifier(
@@ -326,33 +330,37 @@ def fetch_exchange_raw(symbol: str, bse_code: Optional[str], years: list[str]) -
         bse_code=bse_code or "",
     )
 
-    all_results: list[WebDataResult] = []
-
-    # Tickertape — annual data, HIGH confidence (comes first so it takes priority)
-    try:
+    def _fetch_tickertape():
         from web.tickertape_connector import TickertapeConnector
-        tt_results = TickertapeConnector().fetch(company, years)
-        all_results.extend(tt_results)
-        logger.info(f"exchange_raw: Tickertape returned {len(tt_results)} data points")
-    except Exception as e:
-        logger.warning(f"exchange_raw: Tickertape fetch failed — {e}")
+        return TickertapeConnector().fetch(company, years)
 
-    # NSE quarterly aggregation
-    try:
-        nse_results = NSEConnector().fetch(company, years)
-        all_results.extend(nse_results)
-        logger.info(f"exchange_raw: NSE returned {len(nse_results)} data points")
-    except Exception as e:
-        logger.warning(f"exchange_raw: NSE fetch failed — {e}")
+    def _fetch_nse():
+        return NSEConnector().fetch(company, years)
 
-    # BSE quarterly XBRL aggregation (fills gaps left by NSE + Tickertape)
-    if bse_code:
-        try:
-            bse_results = BSEConnector().fetch(company, years)
-            all_results.extend(bse_results)
-            logger.info(f"exchange_raw: BSE returned {len(bse_results)} data points")
-        except Exception as e:
-            logger.warning(f"exchange_raw: BSE fetch failed — {e}")
+    def _fetch_bse():
+        return BSEConnector().fetch(company, years) if bse_code else []
+
+    tasks = {
+        "tickertape": _fetch_tickertape,
+        "nse":        _fetch_nse,
+        "bse":        _fetch_bse,
+    }
+
+    all_results: list[WebDataResult] = []
+    _CONNECTOR_TIMEOUT = 25  # seconds per connector
+
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        futures = {ex.submit(fn): name for name, fn in tasks.items()}
+        for fut in as_completed(futures, timeout=_CONNECTOR_TIMEOUT + 5):
+            name = futures[fut]
+            try:
+                results = fut.result(timeout=_CONNECTOR_TIMEOUT)
+                all_results.extend(results)
+                logger.info(f"exchange_raw: {name} returned {len(results)} data points")
+            except FutTimeout:
+                logger.warning(f"exchange_raw: {name} timed out — skipping")
+            except Exception as e:
+                logger.warning(f"exchange_raw: {name} failed — {e}")
 
     if not all_results:
         return {}
@@ -478,64 +486,290 @@ def get_available_reports(symbol: str, bse_code: Optional[str] = None) -> list[d
 # PDF text extraction — raw text from financial pages for LLM context
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def extract_pdf_text_for_llm(pdf_bytes: bytes, max_chars_per_page: int = 3500) -> str:
+# ── Page heading classification ───────────────────────────────────────────────
+#
+# We read only the first 5 non-empty lines of each page (the heading area) to
+# decide what kind of content that page contains.  This is fast and reliable:
+# financial statement pages always start with their section title, and
+# presentation slides always start with the slide title.
+#
+# Three-tier decision per page:
+#   KEEP_FINANCIAL   — core financial statement page (P&L, BS, CF, NPA, metrics)
+#   SKIP             — notes, disclosures, governance, ESG — never useful for LLM
+#   KEEP_ALL         — everything else (only used for short docs where we take all)
+
+_HEADING_KEEP = re.compile(
+    # Annual report financial statements
+    r"balance\s+sheet|profit\s+(?:and|&)\s+loss|profit\s+and\s+loss\s+account"
+    r"|cash\s+flow|income\s+statement|statement\s+of\s+(?:profit|financial\s+position)"
+    r"|revenue\s+from\s+operations|interest\s+(?:earned|income|expended)"
+    # Quarterly / presentation operating metrics
+    r"|asset\s+quality|npa|gnpa|nnpa|net\s+npa|gross\s+npa"
+    r"|net\s+interest\s+(?:margin|income)|nim\b"
+    r"|yield\s+on|cost\s+of\s+(?:funds|deposits|borrowings)"
+    r"|loan\s+book|advances\s+(?:portfolio|mix|break)"
+    r"|key\s+(?:financial|operating|performance)\s+(?:highlights?|metrics?|indicators?)"
+    r"|financial\s+highlights?|operating\s+highlights?"
+    r"|casa|deposit\s+(?:mix|composition|break)"
+    r"|capital\s+(?:adequacy|position)\s+(?:ratio)?"   # CAR is a metric we want
+    r"|return\s+on\s+(?:assets?|equity|capital)"       # RoA, RoE
+    r"|earnings\s+per\s+share|eps\b"
+    r"|provisions?\s+(?:and\s+)?contingenc"
+    r"|net\s+(?:profit|revenue|income)"
+    r"|total\s+(?:assets?|income|revenue|deposits?|advances?)",
+    re.I,
+)
+
+_HEADING_SKIP = re.compile(
+    r"notes?\s+(?:to|on|forming\s+part\s+of)\s+(?:the\s+)?(?:financial|accounts?)"
+    r"|significant\s+accounting\s+polic"
+    r"|basis\s+of\s+(?:preparation|consolidation)"
+    r"|independent\s+auditor|statutory\s+auditor|auditor.s\s+report"
+    r"|related\s+party"
+    r"|directors.{0,2}\s*report|board\s+of\s+directors"
+    r"|corporate\s+governance"
+    r"|management\s+discussion\s+(?:and|&)\s+analysis"   # MD&A narrative — skip
+    r"|business\s+responsibility"
+    r"|\bbrsr\b|\besg\b"
+    r"|sustainability\s+report"
+    r"|csr\s+(?:activit|spend|committee)"
+    # AGM / EGM notices and e-voting pages
+    r"|notice\s+of\s+(?:agm|annual\s+general|egm|extra.?ordinary)"
+    r"|annual\s+general\s+meeting"
+    r"|^notice\s+annual\s+report"        # "Notice ANNUAL REPORT 2024-25" cover page
+    r"|(?:remote\s+)?e.?voting|postal\s+ballot|cut.?off\s+date"
+    r"|(?:ninth|tenth|eleventh|twelfth|thirteenth|special)\s+annual\s+(?:general|report)"
+    # Exchange submission cover letters (the wrapper around the PDF)
+    r"|national\s+stock\s+exchange\s+of\s+india|bombay\s+stock\s+exchange"
+    r"|bse\s+limited|nse\s+(?:limited|india)|exchange\s+plaza"
+    r"|phiroze\s+jeejeebhoy|bandra\s+kurla\s+complex"
+    r"|dear\s+sir\s*/\s*madam|sub:\s+notice|scrip\s+code:"
+    r"|listing\s+obligations?\s+and\s+disclosure"
+    r"|sebi\s+\(listing"
+    # Other non-financial sections
+    r"|secretarial\s+(?:audit|report)"
+    r"|dividend\s+(?:distribution|history)"
+    r"|ten.year\s+(?:financial|summary|highlight)"    # historical summaries — not current year
+    r"|schedule\s+\d+\b",
+    re.I,
+)
+
+
+def _page_heading(raw_text: str, n_lines: int = 5) -> str:
+    """Return the first n non-empty lines joined — the heading area of a page."""
+    lines = [l.strip() for l in raw_text.splitlines() if l.strip()]
+    return " | ".join(lines[:n_lines])
+
+
+def _classify_heading(heading: str) -> str:
     """
-    Extract cleaned plain text from financial statement pages of the PDF.
+    Classify a page heading as 'keep', 'skip', or 'unclear'.
+    'keep'    → include page in LLM context
+    'skip'    → exclude (notes, governance, ESG, etc.)
+    'unclear' → caller decides based on doc_type
+    """
+    h = heading.lower()
+    if _HEADING_KEEP.search(h):
+        return "keep"
+    if _HEADING_SKIP.search(h):
+        return "skip"
+    return "unclear"
 
-    Unlike table extraction (which tries to parse structure), this simply
-    reads text line-by-line.  The LLM then does the semantic understanding.
 
-    Returns a single string ready to be pasted into an LLM prompt.
-    Max total output: ~50 000 characters (keeps token cost reasonable).
+# ── TOC extractor ─────────────────────────────────────────────────────────────
+#
+# Many Indian annual reports and some presentations include a Table of Contents
+# that maps section names → page numbers.  If we find it, we can jump directly
+# to the right pages without scanning every page.
+#
+# Patterns we recognise:
+#   "Balance Sheet ......... 45"   (dot leaders)
+#   "Balance Sheet         45"     (large gap)
+#   "Balance Sheet  45"            (moderate gap, 2+ spaces)
+
+_TOC_LINE_RE = re.compile(
+    r"^(.{4,60?}?)\s*\.{2,}\s*(\d{1,3})\s*$"       # dot leaders
+    r"|^(.{4,60?}?)\s{3,}(\d{1,3})\s*$",            # large whitespace gap
+    re.MULTILINE,
+)
+
+# TOC entry heading → which category it maps to
+_TOC_CATEGORY_MAP = [
+    (re.compile(r"balance\s+sheet|financial\s+position",           re.I), "balance_sheet"),
+    (re.compile(r"profit\s+(?:and|&)\s+loss|income\s+statement",   re.I), "pl"),
+    (re.compile(r"cash\s+flow",                                     re.I), "cash_flow"),
+    (re.compile(r"asset\s+quality|npa",                             re.I), "asset_quality"),
+    (re.compile(r"key\s+(?:financial|operating|performance)|financial\s+highlight", re.I), "highlights"),
+    (re.compile(r"loan\s+book|advances|portfolio",                  re.I), "loan_book"),
+    (re.compile(r"nim|net\s+interest\s+margin|yield|cost\s+of\s+fund", re.I), "nim_yields"),
+    (re.compile(r"operational\s+(?:highlights?|metrics?)|operat",   re.I), "operating"),
+]
+
+
+def _extract_toc(pdf, max_toc_pages: int = 10) -> dict[str, list[int]]:
+    """
+    Scan the first max_toc_pages pages for a Table of Contents.
+    Returns {category: [page_numbers]} if found, else {}.
+    """
+    from utils.helpers import clean_for_llm
+
+    toc: dict[str, list[int]] = {}
+    n_pages = len(pdf.pages)
+
+    for pg_idx in range(min(max_toc_pages, n_pages)):
+        raw = pdf.pages[pg_idx].extract_text() or ""
+        if not raw.strip():
+            continue
+
+        # Look for a concentration of TOC-like lines on this page
+        matches = list(_TOC_LINE_RE.finditer(raw))
+        if len(matches) < 4:          # not a TOC page if fewer than 4 entries
+            continue
+
+        for m in matches:
+            # Groups: (dot-leader title, dot-leader page) or (space title, space page)
+            title = (m.group(1) or m.group(3) or "").strip()
+            pg_str = (m.group(2) or m.group(4) or "").strip()
+            if not title or not pg_str:
+                continue
+            try:
+                target_pg = int(pg_str)
+            except ValueError:
+                continue
+            if not (1 <= target_pg <= n_pages):
+                continue
+
+            # Map title to a known category
+            for pattern, category in _TOC_CATEGORY_MAP:
+                if pattern.search(title):
+                    toc.setdefault(category, []).append(target_pg)
+                    break
+
+        if toc:
+            logger.info(f"pdf_text: TOC found on page {pg_idx + 1} — "
+                        f"{sum(len(v) for v in toc.values())} entries across "
+                        f"{len(toc)} categories")
+            return toc
+
+    return {}
+
+
+def extract_pdf_text_for_llm(
+    pdf_bytes: bytes,
+    max_chars_per_page: int = 3500,
+    doc_type: str = "annual",       # "annual" | "presentation" | "quarterly"
+) -> str:
+    """
+    Extract cleaned plain text from a financial PDF for the LLM.
+
+    Strategy (applied to ALL doc_types):
+      1. Scan the first 10 pages for a Table of Contents.
+         If found, jump directly to the relevant pages.
+      2. For every page NOT covered by the TOC:
+         a. Read only the first 5 lines (the page heading / slide title).
+         b. Classify the heading as 'keep', 'skip', or 'unclear'.
+         c. 'keep'    → extract full page text.
+            'skip'    → skip the page entirely.
+            'unclear' → include for annual reports (may be a schedule);
+                        skip for presentations (off-topic slides).
+      3. Never exceed MAX_TOTAL characters.
+
+    This works for both annual reports (Balance Sheet, P&L, CF headers)
+    and investor presentations (slide titles: "Asset Quality", "NIM Trend").
     """
     try:
         import pdfplumber
     except ImportError:
         return ""
 
-    from extractor.pdf_parser import parse_pdf
-    from extractor.table_extractor import _is_non_financial_page, _classify_text
     from utils.helpers import clean_for_llm
 
-    try:
-        doc = parse_pdf(io.BytesIO(pdf_bytes))
-    except Exception:
-        return ""
-
-    # Collect financial page numbers
-    financial_pages: set[int] = set()
-    for sec in doc.sections:
-        financial_pages.update(sec.page_numbers)
-    for pg_num, pg_text in doc.raw_pages.items():
-        if _classify_text(pg_text):
-            financial_pages.add(pg_num)
-
-    if not financial_pages:
-        return ""
-
-    MAX_TOTAL = 50_000
+    MAX_TOTAL = 60_000
     parts: list[str] = []
     total_chars = 0
 
     try:
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
             n_pages = len(pdf.pages)
-            for pg_num in sorted(financial_pages):
-                if pg_num > n_pages:
+
+            # ── Step 1: Try to extract a Table of Contents ────────────────────
+            toc = _extract_toc(pdf)
+
+            # Build a set of page numbers already targeted by TOC
+            toc_pages: set[int] = set()
+            for pg_list in toc.values():
+                toc_pages.update(pg_list)
+                # Also include the next 1-2 pages after each TOC target
+                # (a section often spans multiple pages)
+                for pg in pg_list:
+                    toc_pages.update(p for p in [pg + 1, pg + 2] if p <= n_pages)
+
+            # ── Step 2: Heading-based classification for all pages ────────────
+            # Build a classification for every page cheaply (just heading lines)
+            page_decisions: dict[int, str] = {}   # pg_num → 'keep' | 'skip' | 'unclear'
+
+            for pg_idx in range(n_pages):
+                pg_num = pg_idx + 1
+                if pg_num in toc_pages:
+                    page_decisions[pg_num] = "keep"   # TOC already selected it
                     continue
+                raw = pdf.pages[pg_idx].extract_text() or ""
+                if not raw.strip():
+                    page_decisions[pg_num] = "skip"
+                    continue
+                heading = _page_heading(raw)
+                page_decisions[pg_num] = _classify_heading(heading)
+
+            # ── Step 3: Decide which pages to extract ─────────────────────────
+            # For annual reports:  keep + unclear (schedules, sub-sections)
+            # For presentations:   keep only       (slide titles are explicit)
+            # For quarterly:       keep + unclear  (structured but may lack titles)
+            if doc_type == "presentation":
+                selected = [pg for pg, dec in sorted(page_decisions.items())
+                            if dec == "keep"]
+                # If heading-based selection found nothing (image-heavy slides
+                # with embedded text → no extractable heading), fall back to all
+                if not selected:
+                    logger.warning(
+                        "pdf_text: no 'keep' pages found via headings for presentation "
+                        "— falling back to all pages"
+                    )
+                    selected = [pg for pg, dec in sorted(page_decisions.items())
+                                if dec != "skip"]
+            else:
+                # annual + quarterly: include unclear pages (schedules, sub-tables)
+                selected = [pg for pg, dec in sorted(page_decisions.items())
+                            if dec in ("keep", "unclear")]
+                # Always fall back to everything if nothing matched
+                if not selected:
+                    logger.warning(
+                        "pdf_text: heading classifier found 0 pages — "
+                        "falling back to full scan"
+                    )
+                    selected = list(range(1, n_pages + 1))
+
+            logger.info(
+                f"pdf_text [{doc_type}]: {n_pages} total pages | "
+                f"TOC pages: {len(toc_pages)} | selected: {len(selected)}"
+            )
+
+            # ── Step 4: Extract text from selected pages ───────────────────────
+            for pg_num in selected:
                 if total_chars >= MAX_TOTAL:
                     break
                 raw_text = pdf.pages[pg_num - 1].extract_text() or ""
                 if not raw_text.strip():
                     continue
-                if _is_non_financial_page(raw_text):
-                    continue
+                heading = _page_heading(raw_text)
                 cleaned = clean_for_llm(raw_text)[:max_chars_per_page]
-                parts.append(f"\n=== Page {pg_num} ===\n{cleaned}")
-                total_chars += len(cleaned)
-    except Exception:
-        pass
+                if cleaned.strip():
+                    parts.append(f"\n=== Page {pg_num} [{heading[:80]}] ===\n{cleaned}")
+                    total_chars += len(cleaned)
 
+    except Exception as e:
+        logger.warning(f"extract_pdf_text_for_llm: {e}")
+
+    logger.info(f"pdf_text: extracted {total_chars:,} chars from {len(parts)} pages")
     return "\n".join(parts)
 
 
@@ -780,6 +1014,7 @@ def llm_map_fields(
 
     user_prompt = "\n".join(lines)
 
+    last_error: str = "unknown error"
     for attempt in range(3):
         try:
             resp = client.chat.completions.create(
@@ -804,16 +1039,19 @@ def llm_map_fields(
                     result[k] = {yr: None for yr in years}
             return result
 
-        except json.JSONDecodeError:
-            if attempt == 2:
-                return {}
-            time.sleep(1)
-        except Exception:
-            if attempt == 2:
-                return {}
-            time.sleep(2)
+        except json.JSONDecodeError as e:
+            last_error = f"JSON parse error: {e} | Raw response started: {raw[:300]!r}"
+            logger.error(f"llm_map_fields attempt {attempt+1}/3: {last_error}")
+            if attempt < 2:
+                time.sleep(1)
+        except Exception as e:
+            last_error = f"{type(e).__name__}: {e}"
+            logger.error(f"llm_map_fields attempt {attempt+1}/3: {last_error}")
+            if attempt < 2:
+                time.sleep(2)
 
-    return {}
+    # All retries exhausted — raise so caller can surface the real error
+    raise RuntimeError(f"LLM failed after 3 attempts: {last_error}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -883,7 +1121,9 @@ def write_to_template(template_bytes: bytes, filled: dict, overwrite: bool = Fal
                 if cell.data_type == "f" or (isinstance(cell.value, str) and cell.value.startswith("=")):
                     stats["skipped_formula"] += 1
                     continue
-                if not overwrite and cell.value not in (None, "", 0):
+                # Treat dash placeholders as empty — Indian templates use "-" / "—" for blank cells
+                _is_empty = cell.value in (None, "", 0, "-", "—", "–", "—")
+                if not overwrite and not _is_empty:
                     stats["skipped_filled"] += 1
                     continue
                 cell.value = round(val, 2)
@@ -912,6 +1152,14 @@ with st.sidebar:
 
     stmt_type  = st.radio("Statement type", ["Consolidated", "Standalone"], horizontal=True)
     overwrite  = st.checkbox("Overwrite existing cell values", value=False)
+
+    st.markdown("---")
+    st.header("🌐 Company Website (optional)")
+    st.caption("Auto-detected from NSE/BSE. Paste here if auto-detection fails.")
+    manual_company_site = st.text_input(
+        "Company website URL",
+        placeholder="e.g. https://www.equitasbnk.com",
+    ).strip().rstrip("/")
 
     st.markdown("---")
     st.header("📄 Annual Report PDF")
@@ -969,10 +1217,32 @@ if run_btn:
         st.error("Please enter your DeepSeek API key.")
         st.stop()
 
+    # ── Quick API key check before running anything expensive ─────────────────
+    try:
+        _test_client = OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
+        _test_resp   = _test_client.chat.completions.create(
+            model=api_model,
+            messages=[{"role": "user", "content": "Reply with the single word: OK"}],
+            max_tokens=5, temperature=0,
+        )
+        if "ok" not in _test_resp.choices[0].message.content.strip().lower():
+            st.warning("⚠️ LLM API responded but gave unexpected output — proceeding anyway.")
+    except Exception as _api_err:
+        st.error(f"❌ Cannot reach DeepSeek API: {type(_api_err).__name__}: {_api_err}\n\nCheck your API key and try again.")
+        st.stop()
+
     client     = OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
     consolidated = stmt_type == "Consolidated"
     progress   = st.progress(0, text="Starting…")
     status     = st.empty()
+
+    # Inject manually-provided company website into the cache so all fetchers
+    # (presentations, quarterly results, annual reports) use it automatically.
+    if manual_company_site:
+        from web.pdf_fetcher import _website_cache
+        cache_key = f"{nse_symbol}:{bse_code or ''}"
+        _website_cache[cache_key] = manual_company_site
+        st.toast(f"Using company website: {manual_company_site}", icon="🌐")
 
     try:
         # ── 1. Read template ──────────────────────────────────────────────────
@@ -1265,7 +1535,9 @@ if run_btn:
         if pres_bytes:
             progress.progress(56, text="Extracting investor presentation text…")
             with st.spinner(f"Extracting text from **{pres_label}**…"):
-                pres_text = extract_pdf_text_for_llm(pres_bytes, max_chars_per_page=4000)
+                pres_text = extract_pdf_text_for_llm(
+                    pres_bytes, max_chars_per_page=4000, doc_type="presentation"
+                )
             st.metric("Presentation text chars", f"{len(pres_text):,}")
             with st.expander("📊 Investor presentation text (sample)"):
                 st.text(pres_text[:2000] + ("…" if len(pres_text) > 2000 else ""))
@@ -1275,7 +1547,9 @@ if run_btn:
         if qres_bytes:
             progress.progress(59, text="Extracting quarterly result text…")
             with st.spinner(f"Extracting text from **{qres_label}**…"):
-                qres_text = extract_pdf_text_for_llm(qres_bytes, max_chars_per_page=4500)
+                qres_text = extract_pdf_text_for_llm(
+                    qres_bytes, max_chars_per_page=4500, doc_type="quarterly"
+                )
             ann_note = " (Q4 — includes annual figures)" if qres_is_annual else ""
             st.metric(f"Quarterly result text chars{ann_note}", f"{len(qres_text):,}")
             with st.expander("📋 Quarterly result text (sample)"):
@@ -1342,24 +1616,64 @@ if run_btn:
                         + qres_text[:8000]
                     )
 
-            sheet_filled = llm_map_fields(
-                sheet_name=sheet_name,
-                template_labels=sheet_data["labels"],
-                years=sheet_data["years"],
-                screener_raw=screener_raw,
-                yfinance_raw=yfinance_raw,
-                pdf_data=pdf_data,
-                client=client,
-                model=api_model,
-                pdf_text=effective_pdf_text,
-                exchange_raw=exchange_raw,
-                xbrl_data=qres_xbrl_data if qres_xbrl_data else None,
-            )
+            # Collect years that have real source data — avoids sending F2016
+            # to the LLM when we have zero data for it (just wastes tokens).
+            _data_years: set[str] = set()
+            _fy_re = re.compile(r"^F\d{4}$")
+
+            # Screener: {"section": {"years": ["F2025",...], "data": {...}}}
+            for _sec in screener_raw.values():
+                if isinstance(_sec, dict):
+                    _data_years.update(y for y in _sec.get("years", []) if _fy_re.match(str(y)))
+
+            # Exchange: same layout as Screener
+            for _sec in (exchange_raw or {}).values():
+                if isinstance(_sec, dict):
+                    _data_years.update(y for y in _sec.get("years", []) if _fy_re.match(str(y)))
+
+            # yfinance: {"section_name": {"F2025": {"metric": val}, ...}}
+            for _sec in yfinance_raw.values():
+                if isinstance(_sec, dict):
+                    _data_years.update(k for k in _sec if _fy_re.match(str(k)))
+
+            # PDF structured data: {"section": {"F2025": {"label": val}, ...}}
+            for _sec in pdf_data.values():
+                if isinstance(_sec, dict):
+                    _data_years.update(k for k in _sec if _fy_re.match(str(k)))
+
+            # Always keep the two most-recent template years even without source data
+            _tmpl_years = sorted(sheet_data["years"], reverse=True)
+            _ask_years  = sorted(
+                {y for y in sheet_data["years"] if y in _data_years}
+                | set(_tmpl_years[:2]),
+                reverse=True,
+            ) or sheet_data["years"]   # last resort: all template years
+
+            try:
+                sheet_filled = llm_map_fields(
+                    sheet_name=sheet_name,
+                    template_labels=sheet_data["labels"],
+                    years=_ask_years,
+                    screener_raw=screener_raw,
+                    yfinance_raw=yfinance_raw,
+                    pdf_data=pdf_data,
+                    client=client,
+                    model=api_model,
+                    pdf_text=effective_pdf_text,
+                    exchange_raw=exchange_raw,
+                    xbrl_data=qres_xbrl_data if qres_xbrl_data else None,
+                )
+            except RuntimeError as _llm_err:
+                st.error(f"❌ **{sheet_name}** — LLM error: {_llm_err}")
+                sheet_filled = {}
+            except Exception as _llm_err:
+                st.error(f"❌ **{sheet_name}** — unexpected error: {type(_llm_err).__name__}: {_llm_err}")
+                sheet_filled = {}
 
             n = sum(1 for yv in sheet_filled.values() for v in yv.values() if v is not None)
             total_matched += n
             filled[sheet_name] = sheet_filled
-            st.info(f"  **{sheet_name}**: {n} values matched")
+            st.info(f"  **{sheet_name}**: {n} values matched ({len(_ask_years)} years: {', '.join(_ask_years[:4])}{'…' if len(_ask_years)>4 else ''})")
 
         with st.expander("🧠 LLM mapping preview"):
             for sn, sf in filled.items():

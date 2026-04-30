@@ -75,10 +75,13 @@ def normalise_year(raw: str) -> Optional[str]:
     if m:
         return f"F{m.group(1)}"
 
-    # Pattern: plain 4-digit year 2025
+    # Pattern: plain 4-digit year 2025 — only accept plausible fiscal years
     m = re.match(r"^(\d{4})$", key)
     if m:
-        return f"F{m.group(1)}"
+        yr = int(m.group(1))
+        if 2000 <= yr <= 2040:
+            return f"F{yr}"
+        return None   # reject e.g. "1000", "9999", "1234"
 
     return None
 

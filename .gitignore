@@ -1,9 +1,0 @@
-*.pyc
-__pycache__/
-*.xlsx
-*.pdf
-*.csv
-venv/
-.git_old/
-config/companies/generic.yaml
-config/companies/piramal.yaml
