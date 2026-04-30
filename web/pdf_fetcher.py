@@ -503,8 +503,7 @@ def download_pdf(url: str, progress_cb=None) -> Optional[bytes]:
 _PRESENTATION_CONFIRM = re.compile(
     r"investor.?present|analyst.?day|investor.?day|investor.?meet"
     r"|investor.?brief|investor.?update|corporate.?present"
-    r"|fact.?sheet|investor.?deck|quarterly.?update"
-    r"|q[1-4].?fy\d{2}|fy\d{2}.?q[1-4]",          # quarterly investor docs
+    r"|fact.?sheet|investor.?deck|quarterly.?update",
     re.I,
 )
 
@@ -648,10 +647,253 @@ def fetch_bse_presentation_list(bse_code: str) -> list[dict]:
     return results
 
 
+def _extract_website_from_html(html: str, skip_domains: tuple = ()) -> Optional[str]:
+    """
+    Extract the company's official website URL from a page's HTML.
+    Searches for external links near 'website' / 'visit' label text.
+    Skips known aggregator domains.
+    """
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        return None
+
+    _SKIP = {
+        "screener.in", "bseindia.com", "nseindia.com", "moneycontrol.com",
+        "tickertape.in", "google.com", "yahoo.com", "economictimes.com",
+        "bloomberg.com", "reuters.com", "trendlyne.com", "valueresearchonline.com",
+        *skip_domains,
+    }
+
+    soup = BeautifulSoup(html, "html.parser")
+
+    # Strategy 1: find a link immediately following a "Website" label
+    for tag in soup.find_all(string=re.compile(r"\bwebsite\b", re.I)):
+        parent = tag.parent
+        for container in [parent, parent.parent if parent else None]:
+            if not container:
+                continue
+            a = container.find("a", href=True)
+            if a:
+                href = a["href"].strip()
+                if href.startswith("http") and not any(d in href for d in _SKIP):
+                    return href.rstrip("/")
+
+    # Strategy 2: any external link in company-info / about sections
+    for section_id in ("company-info", "about", "company-details", "about-company"):
+        sec = soup.find(id=re.compile(section_id, re.I)) or \
+              soup.find(class_=re.compile(section_id.replace("-", ".?"), re.I))
+        if sec:
+            for a in sec.find_all("a", href=True):
+                href = a["href"].strip()
+                if href.startswith("http") and not any(d in href for d in _SKIP):
+                    return href.rstrip("/")
+
+    return None
+
+
+# Module-level cache: symbol → website URL (avoids repeated lookups per session)
+_website_cache: dict[str, Optional[str]] = {}
+
+
+def _get_company_website(symbol: str, bse_code: Optional[str] = None) -> Optional[str]:
+    """
+    Resolve a company's official website URL.  Results are cached in-process
+    so repeated calls for the same company cost nothing.
+
+    Sources tried in order (most → least reliable for server/cloud deployment):
+      1. yfinance Ticker.info['website']  — designed for programmatic use,
+                                            works from any server IP
+      2. BSE ComHeader API                — proper JSON API, generally accessible
+      3. Screener.in company page         — explicit 'Website' link, may rate-limit
+                                            on cloud IPs but usually works
+      4. BSE stock page HTML scrape       — last resort HTML scrape
+    """
+    cache_key = f"{symbol}:{bse_code}"
+    if cache_key in _website_cache:
+        return _website_cache[cache_key]
+
+    requests = _get_requests()
+
+    def _cache_and_return(url: Optional[str]) -> Optional[str]:
+        _website_cache[cache_key] = url
+        return url
+
+    # ── 1. yfinance — works from cloud/server IPs, no scraping needed ─────────
+    try:
+        import yfinance as yf
+        for suffix in (".NS", ".BO", ""):
+            ticker_sym = symbol.upper() + suffix
+            info = yf.Ticker(ticker_sym).info
+            site = info.get("website") or info.get("companyOfficialSite")
+            if site and site.startswith("http"):
+                logger.info(f"pdf_fetcher: company website from yfinance ({ticker_sym}): {site}")
+                return _cache_and_return(site.rstrip("/"))
+    except Exception as e:
+        logger.debug(f"pdf_fetcher: yfinance website lookup failed: {e}")
+
+    # ── 2. BSE ComHeader JSON (proper API — accessible from servers) ──────────
+    if bse_code:
+        try:
+            bse_h = {**_HEADERS, "Accept": "application/json, */*",
+                     "Referer": "https://www.bseindia.com/",
+                     "Origin": "https://www.bseindia.com"}
+            resp = requests.get(
+                "https://api.bseindia.com/BseIndiaAPI/api/ComHeader/w",
+                params={"quotetype": "EQ", "scripcode": bse_code},
+                headers=bse_h, timeout=_TIMEOUT,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                rec  = data if isinstance(data, dict) else (data[0] if isinstance(data, list) and data else {})
+                for v in rec.values():
+                    if isinstance(v, str) and v.startswith("http") and "." in v:
+                        if not any(d in v for d in ("bseindia", "nseindia")):
+                            logger.info(f"pdf_fetcher: company website from BSE ComHeader: {v}")
+                            return _cache_and_return(v.rstrip("/"))
+        except Exception as e:
+            logger.debug(f"pdf_fetcher: BSE ComHeader failed: {e}")
+
+    # ── 3. Screener.in (reliable but may rate-limit on cloud IPs) ────────────
+    for suffix in ("/consolidated/", "/"):
+        try:
+            url  = f"https://www.screener.in/company/{symbol.upper()}{suffix}"
+            resp = requests.get(url, headers=_HEADERS, timeout=_TIMEOUT)
+            if resp.status_code == 200:
+                site = _extract_website_from_html(resp.text)
+                if site:
+                    logger.info(f"pdf_fetcher: company website from Screener: {site}")
+                    return _cache_and_return(site)
+        except Exception as e:
+            logger.debug(f"pdf_fetcher: Screener website lookup failed: {e}")
+
+    # ── 4. BSE stock page HTML scrape (last resort) ───────────────────────────
+    if bse_code:
+        try:
+            bse_page = (
+                f"https://www.bseindia.com/stock-share-price/"
+                f"placeholder/placeholder/{bse_code}/"
+            )
+            resp = requests.get(bse_page, headers=_HEADERS, timeout=_TIMEOUT)
+            if resp.status_code == 200:
+                site = _extract_website_from_html(resp.text)
+                if site:
+                    logger.info(f"pdf_fetcher: company website from BSE page: {site}")
+                    return _cache_and_return(site)
+        except Exception as e:
+            logger.debug(f"pdf_fetcher: BSE page scrape failed: {e}")
+
+    logger.warning(f"pdf_fetcher: could not resolve company website for {symbol}")
+    return _cache_and_return(None)
+
+
+def fetch_company_ir_presentations(
+    symbol: str,
+    bse_code: Optional[str] = None,
+) -> list[dict]:
+    """
+    Scrape the company's own Investor Relations page for presentation PDFs.
+
+    Strategy:
+      1. Resolve company website from BSE/NSE profile.
+      2. Try common IR page paths (/investor-relations, /investors, /ir, …)
+      3. Also try subpaths for presentations specifically.
+      4. Collect all PDF links matching investor presentation patterns.
+      5. Return same dict format as other fetchers.
+
+    This is entirely generic — no hardcoded company names or URLs.
+    """
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        return []
+
+    requests = _get_requests()
+
+    company_site = _get_company_website(symbol, bse_code)
+    if not company_site:
+        logger.info(f"pdf_fetcher: IR scraper — no company website found for {symbol}")
+        return []
+
+    # Common IR page path patterns used by Indian listed companies
+    _IR_PATHS = [
+        "/investor-relations/presentations",
+        "/investor-relations/investor-presentation",
+        "/investor-relations/financial-results",
+        "/investor-relations",
+        "/investors/presentations",
+        "/investors/investor-presentation",
+        "/investors",
+        "/ir/presentations",
+        "/ir",
+        "/corporate/investor-relations",
+        "/about-us/investor-relations",
+    ]
+
+    found_pdfs: dict[str, dict] = {}   # url → record
+
+    for path in _IR_PATHS:
+        page_url = f"{company_site}{path}"
+        try:
+            resp = requests.get(page_url, headers=_HEADERS, timeout=_TIMEOUT, allow_redirects=True)
+            if resp.status_code != 200:
+                continue
+            soup = BeautifulSoup(resp.text, "html.parser")
+
+            for a in soup.find_all("a", href=True):
+                href      = a["href"].strip()
+                link_text = a.get_text(strip=True)
+
+                # Make absolute URL
+                if href.startswith("//"):
+                    href = "https:" + href
+                elif href.startswith("/"):
+                    href = company_site + href
+                elif not href.startswith("http"):
+                    continue
+
+                # Must be a PDF
+                if not (href.lower().endswith(".pdf") or "pdf" in href.lower()):
+                    continue
+
+                # Must look like a presentation
+                if not _is_investor_presentation(href, link_text):
+                    continue
+
+                if href not in found_pdfs:
+                    year_label = _infer_fy_from_text(link_text) or _infer_fy_from_text(href)
+                    filename   = href.split("/")[-1].split("?")[0] or f"{symbol}_ir_presentation.pdf"
+                    found_pdfs[href] = {
+                        "year":     year_label,
+                        "filename": filename,
+                        "url":      href,
+                        "size_mb":  0,
+                        "source":   "Company IR",
+                    }
+                    logger.debug(f"pdf_fetcher: IR scraper found: {filename}")
+
+            if found_pdfs:
+                # Found PDFs on this path — try a couple more subpaths but stop deep search
+                if len(found_pdfs) >= 5:
+                    break
+        except Exception as e:
+            logger.debug(f"pdf_fetcher: IR scraper {page_url}: {e}")
+            continue
+
+    results = list(found_pdfs.values())
+    results.sort(key=lambda r: r["year"] or "", reverse=True)
+    logger.info(f"pdf_fetcher: IR scraper found {len(results)} presentations for {symbol}")
+    return results
+
+
 def get_available_presentations(symbol: str, bse_code: Optional[str] = None) -> list[dict]:
     """
-    Return all available investor presentation links from NSE + BSE,
-    deduplicated by URL and sorted newest-first.
+    Return all available investor presentation links, newest-first.
+
+    Sources tried in order:
+      1. NSE corporate filings  (same endpoint as annual-reports, filtered for presentations)
+      2. BSE PRESN filings      (BSE type=PRESN category)
+      3. Company IR website     (generic scraper — most reliable for recent quarterly decks)
     """
     seen_urls: set[str] = set()
     all_pres: list[dict] = []
@@ -667,8 +909,550 @@ def get_available_presentations(symbol: str, bse_code: Optional[str] = None) -> 
                 all_pres.append(rep)
                 seen_urls.add(rep["url"])
 
+    # If exchange filing search found nothing, try scraping the company's own IR page
+    if not all_pres:
+        logger.info(f"pdf_fetcher: exchange presentation search returned 0 — trying company IR page")
+        for rep in fetch_company_ir_presentations(symbol, bse_code):
+            if rep["url"] not in seen_urls:
+                all_pres.append(rep)
+                seen_urls.add(rep["url"])
+    else:
+        # Even if exchange search found something, supplement with IR page
+        for rep in fetch_company_ir_presentations(symbol, bse_code):
+            if rep["url"] not in seen_urls:
+                all_pres.append(rep)
+                seen_urls.add(rep["url"])
+
     all_pres.sort(key=lambda r: r.get("year") or "", reverse=True)
     return all_pres
+
+
+# ── Quarterly Financial Results PDF helpers ───────────────────────────────────
+
+# Patterns that identify quarterly / half-yearly financial result PDFs.
+_QRESULT_CONFIRM = re.compile(
+    r"financial.?result|quarterly.?result|unaudited.?result|audited.?result"
+    r"|quarter.?ended|quarter.?end|q[1-4].{0,10}result"
+    r"|half.?year.?result|h[12].{0,5}result"
+    r"|results?.for.the.quarter|results?.for.the.half",
+    re.I,
+)
+
+# Indian FY months → quarter map  (Apr=Q1, Jul=Q2, Oct=Q3, Jan=Q4)
+_MONTH_TO_QUARTER: dict[int, str] = {
+    6: "Q1", 7: "Q1",        # Jun/Jul → Q1 ending
+    9: "Q2", 10: "Q2",       # Sep/Oct → Q2 ending
+    12: "Q3", 1: "Q3",       # Dec/Jan → Q3 ending
+    3: "Q4", 4: "Q4",        # Mar/Apr → Q4 ending (annual)
+}
+
+_MONTH_NUM = {
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+}
+
+
+_QRESULT_QUARTER_TAG = re.compile(
+    r"(?<![0-9])q[1-4](?![0-9]).{0,30}result"   # "Q4FY25_Financial_Results"
+    r"|result.{0,30}(?<![0-9])q[1-4](?![0-9])", # "results Q4"
+    re.I,
+)
+
+
+def _is_quarterly_result(filename: str, link_text: str = "") -> bool:
+    """Return True if the document is a quarterly / half-yearly financial result.
+    Explicitly excludes investor presentations even if they mention a quarter."""
+    combined = f"{filename} {link_text}"
+    if _PRESENTATION_CONFIRM.search(combined):
+        return False   # presentations are not financial result filings
+    # Primary: explicit "financial result", "quarterly result" etc.
+    if _QRESULT_CONFIRM.search(combined):
+        return True
+    # Secondary: Qn tag + "result" word anywhere in the string
+    if _QRESULT_QUARTER_TAG.search(combined):
+        return True
+    return False
+
+
+def _infer_quarter(text: str) -> Optional[str]:
+    """
+    Extract quarter label from a string.
+    Returns "Q1", "Q2", "Q3", or "Q4", or None.
+    Priority: explicit Qn tag > month name > date.
+    """
+    # Explicit Q1-Q4  (handles Q4FY25, Q4 FY25, Q4-FY25, Q4/FY25, Q4.)
+    m = re.search(r"(?<![0-9])q([1-4])(?![0-9])", text, re.I)
+    if m:
+        return f"Q{m.group(1)}"
+
+    # Month name (quarter end months: Jun/Sep/Dec/Mar)
+    m = re.search(r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*", text, re.I)
+    if m:
+        mon = _MONTH_NUM.get(m.group(1).lower()[:3])
+        if mon:
+            return _MONTH_TO_QUARTER.get(mon)
+
+    # DD-MM-YYYY or YYYY-MM-DD date
+    m = re.search(r"\b(\d{4})-(\d{2})-(\d{2})\b", text)
+    if m:
+        mon = int(m.group(2))
+        return _MONTH_TO_QUARTER.get(mon)
+    m = re.search(r"\b(\d{2})-(\d{2})-(\d{4})\b", text)
+    if m:
+        mon = int(m.group(2))
+        return _MONTH_TO_QUARTER.get(mon)
+
+    return None
+
+
+def fetch_nse_quarterly_result_pdfs(symbol: str) -> list[dict]:
+    """
+    Fetch quarterly result PDF links from NSE's financial-results API.
+    NSE returns one record per quarter; each record includes pdfLink.
+
+    Returns list of dicts:
+        {
+          "year":      "F2025",
+          "quarter":   "Q4",       # Q1/Q2/Q3/Q4
+          "is_annual": True,       # True only for Q4 (full-year figures included)
+          "filename":  "EQUITASBNK_Q4FY25_Results.pdf",
+          "url":       "https://...",
+          "source":    "NSE",
+        }
+    Sorted newest-first.
+    """
+    session = _nse_session.get()
+    url     = f"{_NSE_API}/financial-results"
+    params  = {"index": "equities", "symbol": symbol.upper(), "period": "Quarterly"}
+
+    try:
+        resp = session.get(url, params=params, headers=_API_HEADERS, timeout=_TIMEOUT)
+        if resp.status_code in (403, 404):
+            return []
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        logger.warning(f"pdf_fetcher: NSE quarterly result PDFs failed for {symbol}: {e}")
+        return []
+
+    records = data if isinstance(data, list) else data.get("data", [])
+    if not isinstance(records, list):
+        return []
+
+    results = []
+    for rec in records:
+        # PDF link field names vary across NSE API versions
+        link = (
+            rec.get("pdfLink") or rec.get("xbrlLink") or
+            rec.get("attachmentURL") or rec.get("fileName") or ""
+        )
+        if not link:
+            continue
+        if link.startswith("/"):
+            link = f"https://www.nseindia.com{link}"
+        if not link.startswith("http"):
+            link = f"https://www.nseindia.com/{link}"
+
+        period    = rec.get("period") or rec.get("toDate") or rec.get("periodEnded") or ""
+        year_label = _infer_fy_from_dates("", str(period)) or _infer_fy_from_text(str(period))
+        quarter    = _infer_quarter(str(period))
+        filename   = link.split("/")[-1].split("?")[0] or f"{symbol}_quarterly_result.pdf"
+
+        results.append({
+            "year":      year_label,
+            "quarter":   quarter,
+            "is_annual": quarter == "Q4",
+            "filename":  filename,
+            "url":       link,
+            "size_mb":   0,
+            "source":    "NSE",
+        })
+
+    results.sort(key=lambda r: (r["year"] or "", r["quarter"] or ""), reverse=True)
+    return results
+
+
+def fetch_bse_quarterly_result_pdfs(bse_code: str) -> list[dict]:
+    """
+    Fetch quarterly result PDF links from BSE's financial results API.
+    BSE returns quarterly result metadata including a PDF download link.
+    """
+    requests = _get_requests()
+    bse_headers = {
+        **_HEADERS,
+        "Accept":  "application/json, */*",
+        "Referer": "https://www.bseindia.com/",
+        "Origin":  "https://www.bseindia.com",
+    }
+
+    # Try consolidated first, then standalone
+    results = []
+    for typeflag in ("C", "S"):
+        url    = "https://api.bseindia.com/BseIndiaAPI/api/FinancialResult4/w"
+        params = {"scripcode": bse_code, "typeflag": typeflag}
+        try:
+            resp = requests.get(url, params=params, headers=bse_headers, timeout=_TIMEOUT)
+            if resp.status_code in (403, 404):
+                continue
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:
+            logger.warning(f"pdf_fetcher: BSE quarterly results failed for {bse_code}: {e}")
+            continue
+
+        records = data if isinstance(data, list) else data.get("Table", data.get("data", []))
+        if not isinstance(records, list):
+            continue
+
+        seen_urls = {r["url"] for r in results}
+        for rec in records:
+            # BSE result record fields
+            link = rec.get("PDFLINKURL") or rec.get("pdfLink") or rec.get("XBRL_LINK") or ""
+            if not link:
+                continue
+            if link.startswith("/"):
+                link = f"https://www.bseindia.com{link}"
+
+            period     = rec.get("TO_DATE") or rec.get("QuarterEndDate") or ""
+            year_label = _infer_fy_from_text(str(period)) or _infer_fy_from_dates("", str(period))
+            quarter    = _infer_quarter(str(period))
+            filename   = link.split("/")[-1].split("?")[0] or f"bse_{bse_code}_result.pdf"
+
+            if link not in seen_urls:
+                # Also capture XBRL link if present in same record
+                xbrl_link = rec.get("XBRL_LINK") or rec.get("XBRLLink") or ""
+                if xbrl_link and xbrl_link.startswith("/"):
+                    xbrl_link = f"https://www.bseindia.com{xbrl_link}"
+                results.append({
+                    "year":      year_label,
+                    "quarter":   quarter,
+                    "is_annual": quarter == "Q4",
+                    "filename":  filename,
+                    "url":       link,
+                    "xbrl_url":  xbrl_link or None,
+                    "size_mb":   0,
+                    "source":    "BSE",
+                })
+                seen_urls.add(link)
+
+        if results:
+            break   # consolidated found — skip standalone
+
+    results.sort(key=lambda r: (r["year"] or "", r["quarter"] or ""), reverse=True)
+    return results
+
+
+def fetch_company_quarterly_result_pdfs(
+    symbol: str,
+    bse_code: Optional[str] = None,
+) -> list[dict]:
+    """
+    Scrape quarterly financial result PDF links from the company's own IR page.
+
+    Tries common IR subpaths for the financial results section, then
+    collects any PDF whose filename / link text matches quarterly result
+    patterns.  Entirely generic — no hardcoded company URLs.
+    """
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        return []
+
+    requests = _get_requests()
+
+    company_site = _get_company_website(symbol, bse_code)
+    if not company_site:
+        logger.info(f"pdf_fetcher: qresult IR scraper — no website for {symbol}")
+        return []
+
+    _IR_RESULT_PATHS = [
+        "/investor-relations/financial-results",
+        "/investor-relations/quarterly-results",
+        "/investor-relations/results",
+        "/investors/financial-results",
+        "/investors/quarterly-results",
+        "/investors/results",
+        "/financial-results",
+        "/quarterly-results",
+        "/investor-relations",          # broad fallback — will filter by pattern
+        "/investors",
+    ]
+
+    found: dict[str, dict] = {}
+
+    for path in _IR_RESULT_PATHS:
+        page_url = f"{company_site}{path}"
+        try:
+            resp = requests.get(page_url, headers=_HEADERS, timeout=_TIMEOUT, allow_redirects=True)
+            if resp.status_code != 200:
+                continue
+            soup = BeautifulSoup(resp.text, "html.parser")
+
+            for a in soup.find_all("a", href=True):
+                href      = a["href"].strip()
+                link_text = a.get_text(strip=True)
+
+                if href.startswith("//"):
+                    href = "https:" + href
+                elif href.startswith("/"):
+                    href = company_site + href
+                elif not href.startswith("http"):
+                    continue
+
+                if not (href.lower().endswith(".pdf") or "pdf" in href.lower()):
+                    continue
+
+                if not _is_quarterly_result(href, link_text):
+                    continue
+
+                if href not in found:
+                    combined   = f"{href} {link_text}"
+                    year_label = _infer_fy_from_text(link_text) or _infer_fy_from_text(href)
+                    quarter    = _infer_quarter(combined)
+                    filename   = href.split("/")[-1].split("?")[0] or f"{symbol}_result.pdf"
+                    found[href] = {
+                        "year":      year_label,
+                        "quarter":   quarter,
+                        "is_annual": quarter == "Q4",
+                        "filename":  filename,
+                        "url":       href,
+                        "size_mb":   0,
+                        "source":    "Company IR",
+                    }
+                    logger.debug(f"pdf_fetcher: qresult scraper found: {filename}")
+
+            if len(found) >= 8:   # enough results, stop scanning
+                break
+        except Exception as e:
+            logger.debug(f"pdf_fetcher: qresult scraper {page_url}: {e}")
+            continue
+
+    results = list(found.values())
+    results.sort(key=lambda r: (r["year"] or "", r["quarter"] or ""), reverse=True)
+    logger.info(f"pdf_fetcher: qresult scraper found {len(results)} results for {symbol}")
+    return results
+
+
+def _parse_xbrl_xml(xml_bytes: bytes, years: Optional[list] = None) -> dict:
+    """
+    Parse an XBRL XML file (IndAS / Indian GAAP format used by BSE/NSE filings).
+
+    Returns:  {template_label: {fy_label: value_in_crores}, ...}
+
+    The XBRL format has:
+      - <context> elements defining time periods (instant or duration)
+      - Fact elements like <in-bfsi:InterestEarned contextRef="..." decimals="-5">1234</in-bfsi:InterestEarned>
+
+    We strip the namespace prefix and match the local tag name against
+    a known-label map, then convert values to INR Crores.
+    """
+    import xml.etree.ElementTree as ET
+
+    # Map of XBRL local tag names (case-insensitive) → template label
+    _XBRL_TAG_MAP: dict[str, str] = {
+        # P&L
+        "interestearned":             "Interest Income",
+        "interestincome":             "Interest Income",
+        "interestexpended":           "Interest Expended",
+        "netinterestincome":          "Net Interest Income",
+        "otheroperatingrevenue":      "Other Income",
+        "otherincome":                "Other Income",
+        "totalrevenuefromoperations": "Revenue from Operations",
+        "revenuefromoperations":      "Revenue from Operations",
+        "totalrevenue":               "Total Revenue",
+        "operatingexpenditure":       "Operating Expenses",
+        "employeecost":               "Employee Expenses",
+        "provisions":                 "Provisions and Contingencies",
+        "provisionandcontingencies":  "Provisions and Contingencies",
+        "operatingprofit":            "Operating Profit",
+        "profitbeforetax":            "Profit Before Tax",
+        "taxexpense":                 "Tax Expense",
+        "profitaftertax":             "Profit After Tax",
+        "profitfortheperiod":         "Profit After Tax",
+        "earningspersharebasic":      "EPS (Basic)",
+        "basicearningspershare":      "EPS (Basic)",
+        "earningspersharediluted":    "EPS (Diluted)",
+        # Balance Sheet
+        "deposits":                   "Deposits",
+        "advances":                   "Advances",
+        "investments":                "Investments",
+        "borrowings":                 "Total Borrowings",
+        "capitalandreserves":         "Total Equity",
+        "reservesandsurplus":         "Reserves and Surplus",
+        "sharecapital":               "Share Capital",
+        "totalassets":                "Total Assets",
+        "cashandcashequivalents":     "Cash and Cash Equivalents",
+        "cashandbalancewithrbi":      "Cash and Balance with RBI",
+        # Asset Quality
+        "grossnpa":                   "Gross NPA",
+        "grossnonperformingassets":   "Gross NPA",
+        "netnonperformingassets":     "Net NPA",
+        "netnpa":                     "Net NPA",
+        "gnparatio":                  "Gross NPA %",
+        "nnparatio":                  "Net NPA %",
+    }
+
+    year_set = set(years) if years else None
+
+    try:
+        root = ET.fromstring(xml_bytes)
+    except ET.ParseError as e:
+        logger.warning(f"xbrl_parser: XML parse error: {e}")
+        return {}
+
+    ns_re = re.compile(r"\{[^}]+\}")   # strip {namespace} prefix
+
+    # ── Parse contexts: contextId → fy_label ──────────────────────────────────
+    # XBRL dates are always YYYY-MM-DD — use _infer_fy_from_dates (not _infer_fy_from_text
+    # which mis-parses "2025-03" as year 2003).
+    contexts: dict[str, str] = {}
+
+    for ctx in root.iter():
+        if ns_re.sub("", ctx.tag).lower() != "context":
+            continue
+        ctx_id   = ctx.get("id", "")
+        end_date = ""
+        for child in ctx:
+            if ns_re.sub("", child.tag).lower() == "period":
+                for gc in child:
+                    if ns_re.sub("", gc.tag).lower() in ("enddate", "instant"):
+                        end_date = (gc.text or "").strip()
+                        break
+                break
+        if end_date:
+            fy = _infer_fy_from_dates("", end_date)   # YYYY-MM-DD → FY label
+            if fy:
+                contexts[ctx_id] = fy
+
+    if not contexts:
+        logger.warning("xbrl_parser: no contexts parsed — XBRL structure may differ")
+        return {}
+
+    # ── Detect reporting unit ─────────────────────────────────────────────────
+    # Indian XBRL filings typically report in INR lakhs.
+    # Scan for explicit unit declarations; auto-detect from magnitude as fallback.
+    multiplier = 0.01   # default: lakhs → crores
+    for elem in root.iter():
+        local = ns_re.sub("", elem.tag).lower()
+        text  = (elem.text or "").strip().lower()
+        if not text:
+            continue
+        if local in ("measure", "unit", "reportingcurrencyunit"):
+            if "crore" in text:
+                multiplier = 1.0
+            elif "lakh" in text or "hundredthousand" in text:
+                multiplier = 0.01
+            elif "million" in text:
+                multiplier = 0.1
+            elif "rupee" in text or "inr" in text:
+                # Raw rupees — divide by 10 million to get crores
+                multiplier = 1e-7
+
+    # ── Parse fact elements ────────────────────────────────────────────────────
+    result: dict[str, dict[str, float]] = {}
+
+    for elem in root.iter():
+        local          = ns_re.sub("", elem.tag).lower()
+        template_label = _XBRL_TAG_MAP.get(local)
+        if not template_label:
+            continue
+
+        ctx_ref = elem.get("contextRef", "")
+        fy      = contexts.get(ctx_ref)
+        if not fy or (year_set and fy not in year_set):
+            continue
+
+        raw_text = (elem.text or "").strip().replace(",", "")
+        if not raw_text:
+            continue
+
+        try:
+            raw_val   = float(raw_text)
+            val_crore = round(raw_val * multiplier, 4)
+        except (ValueError, OverflowError):
+            continue
+
+        label_data = result.setdefault(template_label, {})
+        if fy not in label_data:    # keep first value per label+year
+            label_data[fy] = val_crore
+
+    logger.info(f"xbrl_parser: extracted {len(result)} fields from XBRL")
+    return result
+
+
+def fetch_xbrl_from_url(url: str, years: Optional[list] = None) -> dict:
+    """
+    Download an XBRL file (XML or ZIP containing XML) from a URL and parse it.
+    Returns {template_label: {fy_label: value_crores}}.
+    """
+    requests = _get_requests()
+
+    try:
+        resp = requests.get(url, headers=_HEADERS, timeout=60)
+        if resp.status_code != 200:
+            return {}
+        content = resp.content
+    except Exception as e:
+        logger.warning(f"xbrl_fetch: download failed for {url}: {e}")
+        return {}
+
+    # If ZIP, extract the main XBRL XML inside
+    if url.lower().endswith(".zip") or content[:4] == b"PK\x03\x04":
+        try:
+            import zipfile
+            with zipfile.ZipFile(io.BytesIO(content)) as zf:
+                # Find the first .xml file (usually the main XBRL instance)
+                xml_files = [n for n in zf.namelist()
+                             if n.lower().endswith(".xml") and not n.lower().endswith("_def.xml")
+                             and "_lab" not in n.lower() and "_pre" not in n.lower()]
+                if not xml_files:
+                    return {}
+                with zf.open(xml_files[0]) as f:
+                    content = f.read()
+        except Exception as e:
+            logger.warning(f"xbrl_fetch: ZIP extraction failed: {e}")
+            return {}
+
+    return _parse_xbrl_xml(content, years)
+
+
+def get_available_quarterly_results(
+    symbol: str,
+    bse_code: Optional[str] = None,
+) -> list[dict]:
+    """
+    Return all available quarterly financial result PDF links, newest-first.
+
+    Sources tried:
+      1. NSE financial-results API  (pdfLink per quarter)
+      2. BSE FinancialResult4 API   (PDFLINKURL per quarter)
+      3. Company IR page            (generic scraper, most reliable for recent)
+    """
+    seen_urls: set[str] = set()
+    all_results: list[dict] = []
+
+    for rep in fetch_nse_quarterly_result_pdfs(symbol):
+        if rep["url"] not in seen_urls:
+            all_results.append(rep)
+            seen_urls.add(rep["url"])
+
+    if bse_code:
+        for rep in fetch_bse_quarterly_result_pdfs(bse_code):
+            if rep["url"] not in seen_urls:
+                all_results.append(rep)
+                seen_urls.add(rep["url"])
+
+    # Always also try company IR — most likely to have the latest quarter
+    for rep in fetch_company_quarterly_result_pdfs(symbol, bse_code):
+        if rep["url"] not in seen_urls:
+            all_results.append(rep)
+            seen_urls.add(rep["url"])
+
+    all_results.sort(
+        key=lambda r: (r["year"] or "", r["quarter"] or ""),
+        reverse=True,
+    )
+    return all_results
 
 
 # ── Convenience: get best available report for a given FY ────────────────────

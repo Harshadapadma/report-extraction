@@ -33,6 +33,8 @@ from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).parent))
 
+import logging
+logger = logging.getLogger(__name__)
 
 # ── Auto-install dependencies ──────────────────────────────────────────────────
 def _pip(*pkgs):
@@ -293,13 +295,153 @@ from web.pdf_fetcher import (
     fetch_screener_report_links,
     download_pdf,
     get_available_presentations,
+    get_available_quarterly_results,
+    fetch_xbrl_from_url,
 )
+from web.nse_connector import NSEConnector
+from web.bse_connector import BSEConnector
+from web.base import CompanyIdentifier
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# NSE / BSE structured financial data (quarterly aggregated → annual)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def fetch_exchange_raw(symbol: str, bse_code: Optional[str], years: list[str]) -> dict:
+    """
+    Fetch structured financial data from NSE and BSE quarterly results APIs.
+    Returns the same format as fetch_screener_raw so it can be merged in the
+    LLM prompt:
+      {
+        "P&L":           {"years": [...], "data": {"Revenue...": {"F2025": 1234, ...}}},
+        "Balance Sheet": {...},
+        ...
+      }
+    Data quality: HIGHER than Screener — directly from exchange XBRL submissions.
+    """
+    from web.base import WebDataResult
+
+    company = CompanyIdentifier(
+        name=symbol,
+        nse_symbol=symbol.upper(),
+        bse_code=bse_code or "",
+    )
+
+    all_results: list[WebDataResult] = []
+
+    # Tickertape — annual data, HIGH confidence (comes first so it takes priority)
+    try:
+        from web.tickertape_connector import TickertapeConnector
+        tt_results = TickertapeConnector().fetch(company, years)
+        all_results.extend(tt_results)
+        logger.info(f"exchange_raw: Tickertape returned {len(tt_results)} data points")
+    except Exception as e:
+        logger.warning(f"exchange_raw: Tickertape fetch failed — {e}")
+
+    # NSE quarterly aggregation
+    try:
+        nse_results = NSEConnector().fetch(company, years)
+        all_results.extend(nse_results)
+        logger.info(f"exchange_raw: NSE returned {len(nse_results)} data points")
+    except Exception as e:
+        logger.warning(f"exchange_raw: NSE fetch failed — {e}")
+
+    # BSE quarterly XBRL aggregation (fills gaps left by NSE + Tickertape)
+    if bse_code:
+        try:
+            bse_results = BSEConnector().fetch(company, years)
+            all_results.extend(bse_results)
+            logger.info(f"exchange_raw: BSE returned {len(bse_results)} data points")
+        except Exception as e:
+            logger.warning(f"exchange_raw: BSE fetch failed — {e}")
+
+    if not all_results:
+        return {}
+
+    # Bucket into the same section structure as Screener
+    _SECTION_BY_FIELD = {
+        "Revenue from Operations": "P&L",
+        "Total Revenue":           "P&L",
+        "Other Income":            "P&L",
+        "Total Expenses":          "P&L",
+        "Operating Profit":        "P&L",
+        "Finance Costs":           "P&L",
+        "Depreciation and Amortisation": "P&L",
+        "Profit Before Tax":       "P&L",
+        "Tax Expense":             "P&L",
+        "Profit After Tax":        "P&L",
+        "EPS (Basic)":             "P&L",
+        "EPS (Diluted)":           "P&L",
+        "Interest Income":         "P&L",
+        "Interest Expended":       "P&L",
+        "Net Interest Income":     "P&L",
+        "Provisions and Contingencies": "P&L",
+        "Operating Expenses":      "P&L",
+        "Profit Before Depreciation & Tax": "P&L",
+        # Balance Sheet
+        "Share Capital":           "Balance Sheet",
+        "Reserves and Surplus":    "Balance Sheet",
+        "Total Borrowings":        "Balance Sheet",
+        "Total Liabilities":       "Balance Sheet",
+        "Fixed Assets":            "Balance Sheet",
+        "Investments":             "Balance Sheet",
+        "Total Assets":            "Balance Sheet",
+        "Cash and Cash Equivalents": "Balance Sheet",
+        "Total Equity":            "Balance Sheet",
+        "Deposits":                "Balance Sheet",
+        "Advances":                "Balance Sheet",
+        "Net NPA":                 "Balance Sheet",
+        "Gross NPA":               "Balance Sheet",
+        # Cash Flow (Tickertape)
+        "Net Cash from Operating Activities": "Cash Flow",
+        "Net Cash from Investing Activities": "Cash Flow",
+        "Net Cash from Financing Activities": "Cash Flow",
+        "Capital Expenditure":     "Cash Flow",
+        "Free Cash Flow":          "Cash Flow",
+    }
+
+    sections: dict[str, dict] = {}
+    for res in all_results:
+        sec = _SECTION_BY_FIELD.get(res.template_field, "P&L")
+        if sec not in sections:
+            sections[sec] = {"years": set(), "data": {}}
+        field_data = sections[sec]["data"].setdefault(res.template_field, {})
+        # NSE > BSE — don't overwrite NSE value with BSE value for same field+year
+        if res.year not in field_data:
+            field_data[res.year] = res.value
+        sections[sec]["years"].add(res.year)
+
+    # Serialise sets to sorted lists
+    return {
+        sec: {"years": sorted(sd["years"]), "data": sd["data"]}
+        for sec, sd in sections.items()
+    }
+
+
+def _fmt_exchange_for_llm(exchange_raw: dict, years: list[str], section: str) -> str:
+    """Format exchange data for a given section as JSON lines for the LLM prompt."""
+    sd = exchange_raw.get(section, {})
+    if not sd:
+        return ""
+    d = {
+        lbl: {yr: v for yr, v in yr_vals.items() if yr in years}
+        for lbl, yr_vals in sd.get("data", {}).items()
+    }
+    d = {k: v for k, v in d.items() if v}
+    if not d:
+        return ""
+    return json.dumps(d, indent=2)
+
 
 # Sheets that should be populated from investor presentations rather than
 # (or in addition to) the annual report.  Generic keywords — works for any
 # company template, not just banks.
 _PRESENTATION_SHEET_RE = re.compile(
     r"operat|asset.?qual|npa|nim|yield|spread|kpi|quarter|metrics?",
+    re.I,
+)
+# Sheets that benefit from quarterly result PDFs as primary context
+_QUARTERLY_SHEET_RE = re.compile(
+    r"asset.?qual|npa|gnpa|nnpa|quarter|operat|metrics?|kpi",
     re.I,
 )
 
@@ -466,7 +608,7 @@ You receive:
 Your job: for every template label, find the correct value for each year.
 
 Data source priority (use highest available):
-  RAW PDF TEXT  >  PDF TABLE EXTRACTION  >  SCREENER.IN  >  YAHOO FINANCE
+  XBRL STRUCTURED DATA  >  RAW PDF TEXT  >  PDF TABLE EXTRACTION  >  NSE/BSE EXCHANGE DATA  >  SCREENER.IN  >  YAHOO FINANCE
 
 Semantic matching rules — these labels mean the same thing:
   "Net Profit" = "Profit After Tax" = "PAT" = "Net Income" = "Profit for the year"
@@ -509,6 +651,8 @@ def llm_map_fields(
     client: OpenAI,
     model: str = "deepseek-chat",
     pdf_text: str = "",
+    exchange_raw: dict | None = None,
+    xbrl_data: dict | None = None,
 ) -> dict[str, dict[str, Optional[float]]]:
 
     sl = sheet_name.lower()
@@ -516,18 +660,22 @@ def llm_map_fields(
         s_secs  = ["P&L"]
         yf_secs = ["Income Statement"]
         p_secs  = ["P&L"]
+        exc_secs = ["P&L"]
     elif "balance" in sl or "bs" in sl:
         s_secs  = ["Balance Sheet"]
         yf_secs = ["Balance Sheet"]
         p_secs  = ["Balance Sheet"]
+        exc_secs = ["Balance Sheet"]
     elif "cash" in sl or "cf" in sl:
         s_secs  = ["Cash Flow"]
         yf_secs = ["Cash Flow"]
         p_secs  = ["Cash Flow"]
+        exc_secs = ["Cash Flow"]   # Tickertape covers CF
     else:
-        s_secs  = list(screener_raw.keys())
-        yf_secs = list(yfinance_raw.keys())
-        p_secs  = list(pdf_data.keys())
+        s_secs   = list(screener_raw.keys())
+        yf_secs  = list(yfinance_raw.keys())
+        p_secs   = list(pdf_data.keys())
+        exc_secs = list((exchange_raw or {}).keys())
 
     lines = [
         f"EXCEL SHEET: '{sheet_name}'",
@@ -540,6 +688,18 @@ def llm_map_fields(
         "",
     ]
 
+    # XBRL data — machine-readable, highest quality structured source
+    if xbrl_data:
+        filtered_xbrl = {
+            lbl: {yr: v for yr, v in yr_map.items() if yr in years}
+            for lbl, yr_map in xbrl_data.items()
+        }
+        filtered_xbrl = {k: v for k, v in filtered_xbrl.items() if v}
+        if filtered_xbrl:
+            lines.append("XBRL STRUCTURED DATA (machine-readable exchange filing — HIGHEST PRIORITY):")
+            lines.append(json.dumps(filtered_xbrl, indent=2))
+            lines.append("")
+
     # PDF data — highest priority structured source
     for sec in p_secs:
         if sec not in pdf_data or not pdf_data[sec]:
@@ -549,6 +709,15 @@ def llm_map_fields(
             lines.append(f"PDF TABLE EXTRACTION ({sec}):")
             lines.append(json.dumps(filtered, indent=2))
             lines.append("")
+
+    # Exchange data (NSE/BSE quarterly XBRL aggregated) — higher quality than Screener
+    if exchange_raw:
+        for sec in exc_secs:
+            exc_block = _fmt_exchange_for_llm(exchange_raw, years, sec)
+            if exc_block:
+                lines.append(f"NSE/BSE EXCHANGE DATA ({sec}) — quarterly XBRL aggregated, high confidence:")
+                lines.append(exc_block)
+                lines.append("")
 
     # Screener
     for sec in s_secs:
@@ -770,6 +939,21 @@ with st.sidebar:
             "Upload Investor Presentation PDF", type=["pdf"], key="pres_upload"
         )
 
+    st.markdown("---")
+    st.header("📋 Quarterly Results PDF")
+    st.caption("Asset quality, NPA, operating metrics — sourced from quarterly result filings.")
+    qres_mode = st.radio(
+        "Quarterly result source",
+        ["Auto-fetch from NSE/BSE/Company", "Upload manually", "Skip"],
+        key="qres_mode",
+        help="Q4 result PDFs include full-year P&L figures. All quarters have asset quality data.",
+    )
+    manual_qres_pdf = None
+    if qres_mode == "Upload manually":
+        manual_qres_pdf = st.file_uploader(
+            "Upload Quarterly Result PDF", type=["pdf"], key="qres_upload"
+        )
+
     run_btn = st.button("🚀 Run Full Pipeline", type="primary", use_container_width=True)
 
 
@@ -820,14 +1004,28 @@ if run_btn:
         if not screener_raw and consolidated:
             screener_raw = fetch_screener_raw(nse_symbol, consolidated=False)
 
+        progress.progress(18, text="Fetching NSE/BSE quarterly results…")
+        exchange_raw = fetch_exchange_raw(nse_symbol, bse_code or None, all_years)
+
         progress.progress(22, text="Fetching yfinance…")
         yfinance_raw = fetch_yfinance_raw(nse_symbol, all_years)
 
-        s_count = sum(len(s["data"]) for s in screener_raw.values() if isinstance(s, dict) and "data" in s)
-        y_count = sum(len(v) for s in yfinance_raw.values() for v in (s.values() if isinstance(s, dict) else []))
-        c1, c2 = st.columns(2)
+        s_count   = sum(len(s["data"]) for s in screener_raw.values() if isinstance(s, dict) and "data" in s)
+        exc_count = sum(len(s["data"]) for s in exchange_raw.values() if isinstance(s, dict) and "data" in s)
+        y_count   = sum(len(v) for s in yfinance_raw.values() for v in (s.values() if isinstance(s, dict) else []))
+        c1, c2, c3 = st.columns(3)
         c1.metric("Screener fields", s_count)
-        c2.metric("yfinance metrics", y_count)
+        c2.metric("NSE/BSE exchange fields", exc_count)
+        c3.metric("yfinance metrics", y_count)
+
+        if exchange_raw:
+            with st.expander("📡 NSE/BSE exchange data (quarterly → annual)"):
+                for sn, sd in exchange_raw.items():
+                    st.markdown(f"**{sn}**")
+                    rows = [{"Label": lbl, **{yr: v for yr, v in yv.items() if yr in all_years}}
+                            for lbl, yv in sd.get("data", {}).items()]
+                    if rows:
+                        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
         with st.expander("🔍 Raw Screener data"):
             for sn, sd in screener_raw.items():
@@ -935,6 +1133,81 @@ if run_btn:
                 else:
                     pres_dl_status.warning("⚠️ Presentation download failed — skipping.")
 
+        # ── 3c. Get / download quarterly result PDF (+ XBRL if available) ───────
+        qres_bytes: Optional[bytes] = None
+        qres_label = ""
+        qres_is_annual = False   # True when Q4 result chosen (has full-year figures)
+        qres_xbrl_data: dict = {}   # {template_label: {fy: value}} from XBRL
+
+        if qres_mode == "Upload manually" and manual_qres_pdf:
+            manual_qres_pdf.seek(0)
+            qres_bytes     = manual_qres_pdf.read()
+            qres_label     = manual_qres_pdf.name
+            qres_is_annual = bool(re.search(r"\bq4\b|annual|full.?year", qres_label, re.I))
+
+        elif qres_mode == "Auto-fetch from NSE/BSE/Company":
+            status.info("📋 Step 3c — Searching for quarterly result PDFs…")
+            progress.progress(34, text="Fetching quarterly result list…")
+
+            qresults = get_available_quarterly_results(nse_symbol, bse_code or None)
+
+            if not qresults:
+                st.info("ℹ️ No quarterly result PDFs found — asset quality sheet will use other sources.")
+            else:
+                st.success(f"📋 Found {len(qresults)} quarterly result PDF(s)")
+
+                # Build human-readable labels showing quarter + year + source
+                def _qres_label(r: dict) -> str:
+                    q   = r.get("quarter", "?")
+                    yr  = r.get("year", "?")
+                    src = r.get("source", "")
+                    ann = " ★ Annual" if r.get("is_annual") else ""
+                    return f"{yr} {q}{ann} — {r.get('filename','result.pdf')} [{src}]"
+
+                qres_options = {_qres_label(r): r for r in qresults[:12]}
+                selected_qres_label = st.selectbox(
+                    "Select quarterly result to use:",
+                    list(qres_options.keys()),
+                    key="qres_select",
+                )
+                selected_qres = qres_options[selected_qres_label]
+
+                qres_dl_status = st.empty()
+                qres_dl_status.info(f"⬇️ Downloading **{selected_qres['filename']}**…")
+                # ── Try XBRL first (machine-readable, no PDF parsing needed) ──
+                xbrl_url = selected_qres.get("xbrl_url")
+                if xbrl_url:
+                    qres_dl_status.info(f"📊 Found XBRL link — downloading structured data…")
+                    xbrl_raw = fetch_xbrl_from_url(xbrl_url, years=all_years)
+                    if xbrl_raw:
+                        qres_xbrl_data = xbrl_raw
+                        n_xbrl = sum(len(v) for v in xbrl_raw.values())
+                        qres_dl_status.success(
+                            f"✅ XBRL parsed: **{n_xbrl}** data points (machine-readable, no PDF needed)"
+                        )
+                        with st.expander("📊 XBRL structured data"):
+                            rows = [
+                                {"Label": lbl, **{yr: v for yr, v in yr_map.items() if yr in all_years}}
+                                for lbl, yr_map in xbrl_raw.items()
+                            ]
+                            if rows:
+                                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+                # ── Also download PDF for text extraction (LLM fallback) ──────
+                qres_bytes = download_pdf(selected_qres["url"])
+                if qres_bytes:
+                    qres_label     = selected_qres["filename"]
+                    qres_is_annual = selected_qres.get("is_annual", False)
+                    size_mb        = len(qres_bytes) / 1_048_576
+                    ann_note = " (includes full-year figures)" if qres_is_annual else ""
+                    if not xbrl_url:
+                        qres_dl_status.success(
+                            f"✅ Downloaded **{qres_label}** ({size_mb:.1f} MB){ann_note}"
+                        )
+                else:
+                    if not qres_xbrl_data:
+                        qres_dl_status.warning("⚠️ Quarterly result download failed — skipping.")
+
         # ── 4. Extract PDF data (tables + raw text) ───────────────────────────
         pdf_data: dict = {}
         pdf_text: str  = ""
@@ -990,12 +1263,23 @@ if run_btn:
         # ── 4b. Extract investor presentation text ────────────────────────────
         pres_text: str = ""
         if pres_bytes:
-            progress.progress(58, text="Extracting investor presentation text…")
+            progress.progress(56, text="Extracting investor presentation text…")
             with st.spinner(f"Extracting text from **{pres_label}**…"):
                 pres_text = extract_pdf_text_for_llm(pres_bytes, max_chars_per_page=4000)
             st.metric("Presentation text chars", f"{len(pres_text):,}")
             with st.expander("📊 Investor presentation text (sample)"):
                 st.text(pres_text[:2000] + ("…" if len(pres_text) > 2000 else ""))
+
+        # ── 4c. Extract quarterly result text ─────────────────────────────────
+        qres_text: str = ""
+        if qres_bytes:
+            progress.progress(59, text="Extracting quarterly result text…")
+            with st.spinner(f"Extracting text from **{qres_label}**…"):
+                qres_text = extract_pdf_text_for_llm(qres_bytes, max_chars_per_page=4500)
+            ann_note = " (Q4 — includes annual figures)" if qres_is_annual else ""
+            st.metric(f"Quarterly result text chars{ann_note}", f"{len(qres_text):,}")
+            with st.expander("📋 Quarterly result text (sample)"):
+                st.text(qres_text[:2000] + ("…" if len(qres_text) > 2000 else ""))
 
         # ── 5. LLM maps everything → template ─────────────────────────────────
         status.info("🧠 Step 5 / 5 — LLM matching all data to template labels…")
@@ -1008,18 +1292,55 @@ if run_btn:
             pct = 65 + int((i / len(sheets_data)) * 22)
             progress.progress(pct, text=f"LLM: mapping '{sheet_name}'…")
 
-            # Route: presentation-type sheets (Operating Metrics, Asset Quality,
-            # NPA, KPI, etc.) get the investor presentation text as primary
-            # context; annual-report sheets get the annual report PDF text.
-            # If both are available, presentation sheets also get the AR text
-            # appended so ratio cross-checks remain possible.
-            if _PRESENTATION_SHEET_RE.search(sheet_name) and pres_text:
-                effective_pdf_text = pres_text
+            # ── PDF text routing per sheet type ───────────────────────────────
+            # Priority layers (all trimmed to keep token budget sane):
+            #
+            #   Asset Quality / NPA / Operating Metrics / KPI sheets:
+            #     Primary   → quarterly result text  (most granular NPA breakdown)
+            #     Secondary → investor presentation text  (may have summary tables)
+            #     Supplement → annual report text (cross-check)
+            #
+            #   Presentation-type sheets (NIM, yield, spread, etc.):
+            #     Primary   → investor presentation
+            #     Secondary → quarterly result
+            #     Supplement → annual report
+            #
+            #   P&L / BS / CF / other (annual-report sheets):
+            #     Primary   → annual report text
+            #     +Q4 supplement → quarterly result text if Q4 (has annual figures)
+
+            is_qsheet = bool(_QUARTERLY_SHEET_RE.search(sheet_name))
+            is_psheet = bool(_PRESENTATION_SHEET_RE.search(sheet_name)) and not is_qsheet
+
+            if is_qsheet:
+                parts = []
+                if qres_text:
+                    parts.append(qres_text)
+                if pres_text:
+                    parts.append("\n\n=== INVESTOR PRESENTATION ===\n" + pres_text[:6000])
                 if pdf_text:
-                    # Append a trimmed slice of the AR text for context
-                    effective_pdf_text += "\n\n=== ANNUAL REPORT SUPPLEMENT ===\n" + pdf_text[:6000]
+                    parts.append("\n\n=== ANNUAL REPORT SUPPLEMENT ===\n" + pdf_text[:4000])
+                effective_pdf_text = "\n".join(parts) if parts else pdf_text
+
+            elif is_psheet:
+                parts = []
+                if pres_text:
+                    parts.append(pres_text)
+                if qres_text:
+                    parts.append("\n\n=== QUARTERLY RESULT SUPPLEMENT ===\n" + qres_text[:6000])
+                if pdf_text:
+                    parts.append("\n\n=== ANNUAL REPORT SUPPLEMENT ===\n" + pdf_text[:4000])
+                effective_pdf_text = "\n".join(parts) if parts else pdf_text
+
             else:
+                # Annual-report sheet (P&L, BS, CF)
                 effective_pdf_text = pdf_text
+                if qres_is_annual and qres_text:
+                    # Q4 quarterly result always contains full-year P&L — very useful
+                    effective_pdf_text += (
+                        "\n\n=== Q4 QUARTERLY RESULT (contains full-year figures) ===\n"
+                        + qres_text[:8000]
+                    )
 
             sheet_filled = llm_map_fields(
                 sheet_name=sheet_name,
@@ -1031,6 +1352,8 @@ if run_btn:
                 client=client,
                 model=api_model,
                 pdf_text=effective_pdf_text,
+                exchange_raw=exchange_raw,
+                xbrl_data=qres_xbrl_data if qres_xbrl_data else None,
             )
 
             n = sum(1 for yv in sheet_filled.values() for v in yv.values() if v is not None)
@@ -1060,9 +1383,13 @@ if run_btn:
         # Sources banner
         sources = []
         if s_count:         sources.append("Screener.in")
+        if exc_count:       sources.append("NSE/BSE Exchange")
         if y_count:         sources.append("yfinance")
         if pdf_field_count: sources.append(f"Annual Report ({pdf_label})")
         if pres_text:       sources.append(f"Investor Presentation ({pres_label})")
+        if qres_text:
+            ann = " [Q4/Annual]" if qres_is_annual else ""
+            sources.append(f"Quarterly Result{ann} ({qres_label})")
 
         status.success(
             f"✅ Done! **{stats['written']}** cells written · "
