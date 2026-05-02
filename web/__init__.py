@@ -20,7 +20,13 @@ Usage:
     validation = collector.cross_validate(pdf_results, results)
 """
 
-from web.base import CompanyIdentifier, WebDataResult, CrossValidationResult
-from web.collector import WebCollector
-
-__all__ = ["CompanyIdentifier", "WebDataResult", "CrossValidationResult", "WebCollector"]
+# Intentionally no imports here.
+# web/__init__.py is kept empty to avoid Python 3.11 import-machinery errors
+# (KeyError: 'web.base') that occur when Streamlit reruns the script without
+# clearing sys.modules, leaving submodules in a broken partial-load state.
+#
+# Import directly from submodules instead:
+#   from web.base import CompanyIdentifier
+#   from web.collector import WebCollector
+#   from web.nse_connector import NSEConnector
+#   etc.

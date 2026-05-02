@@ -70,43 +70,73 @@ _API_HEADERS = {
 # The "xbrl" field names vary by period; we use the "consolidated" nested object.
 
 _PL_FIELD_MAP: dict[str, str] = {
-    # Revenue
+    # Revenue — camelCase (new NSE API) + snake_case variants
     "netSales":                     "Revenue from Operations",
+    "net_sales":                    "Revenue from Operations",
     "totalRevenue":                 "Total Revenue",
+    "total_revenue":                "Total Revenue",
     "otherIncome":                  "Other Income",
+    "other_income":                 "Other Income",
     # Expenses
     "totalExpenditure":             "Total Expenses",
+    "total_expenditure":            "Total Expenses",
+    "totalExpenses":                "Total Expenses",
     "operatingProfit":              "Operating Profit",
+    "operating_profit":             "Operating Profit",
     "pbdt":                         "Profit Before Depreciation & Tax",
     "depreciation":                 "Depreciation and Amortisation",
     "interest":                     "Finance Costs",
+    "financeCharges":               "Finance Costs",
     "pbt":                          "Profit Before Tax",
+    "profit_before_tax":            "Profit Before Tax",
+    "profitBeforeTax":              "Profit Before Tax",
     "tax":                          "Tax Expense",
+    "taxExpense":                   "Tax Expense",
     "pat":                          "Profit After Tax",
     "netProfit":                    "Profit After Tax",
+    "net_profit":                   "Profit After Tax",
     "eps":                          "EPS (Basic)",
-    # Banking
+    "epsBasic":                     "EPS (Basic)",
+    "epsDiluted":                   "EPS (Diluted)",
+    # Banking (both camelCase and underscore)
     "interestEarned":               "Interest Income",
+    "interest_earned":              "Interest Income",
     "interestExpended":             "Interest Expended",
+    "interest_expended":            "Interest Expended",
     "netInterestIncome":            "Net Interest Income",
+    "net_interest_income":          "Net Interest Income",
     "provisions":                   "Provisions and Contingencies",
+    "provisionsAndContingencies":   "Provisions and Contingencies",
     "operatingExpenditure":         "Operating Expenses",
+    "operating_expenditure":        "Operating Expenses",
 }
 
 _BS_FIELD_MAP: dict[str, str] = {
     "paidUpCapital":                "Share Capital",
+    "paid_up_capital":              "Share Capital",
+    "shareCapital":                 "Share Capital",
     "reserves":                     "Reserves and Surplus",
+    "reservesSurplus":              "Reserves and Surplus",
     "borrowings":                   "Total Borrowings",
+    "totalBorrowings":              "Total Borrowings",
     "totalLiabilities":             "Total Liabilities",
+    "total_liabilities":            "Total Liabilities",
     "fixedAssets":                  "Fixed Assets",
+    "fixed_assets":                 "Fixed Assets",
     "investments":                  "Investments",
     "totalAssets":                  "Total Assets",
+    "total_assets":                 "Total Assets",
     "cash":                         "Cash and Cash Equivalents",
+    "cashAndEquivalents":           "Cash and Cash Equivalents",
     # Banking
     "deposits":                     "Deposits",
     "advances":                     "Advances",
     "netNpa":                       "Net NPA",
+    "net_npa":                      "Net NPA",
     "grossNpa":                     "Gross NPA",
+    "gross_npa":                    "Gross NPA",
+    "netNPA":                       "Net NPA",
+    "grossNPA":                     "Gross NPA",
 }
 
 _CUMULATIVE_FIELDS = {
@@ -272,18 +302,32 @@ class NSEConnector:
             resp.raise_for_status()
             data = resp.json()
 
-            # NSE returns {"data": [...records...]}
+            # NSE returns {"data": [...records...]} or a flat list
             records = data if isinstance(data, list) else data.get("data", [])
             if not isinstance(records, list):
+                # Some NSE responses use different wrapper keys
+                for wrap_key in ("results", "financialResults", "quarterlyResults"):
+                    if isinstance(data, dict) and wrap_key in data:
+                        records = data[wrap_key]
+                        break
+            if not isinstance(records, list) or not records:
+                logger.info(f"NSEConnector: empty/unexpected response shape: {type(data)}, keys={list(data.keys()) if isinstance(data, dict) else 'N/A'}")
                 return []
+
+            # Log first record keys so we can debug field mismatches
+            if records:
+                logger.info(f"NSEConnector: first record keys = {list(records[0].keys())[:25]}")
 
             # Filter to the consolidation type we want
             filtered = []
             for rec in records:
-                rtype = str(rec.get("consolidatedOrStandalone", "")).strip()
-                if consolidated and rtype.lower() in ("consolidated", "con", "c"):
+                rtype = str(
+                    rec.get("consolidatedOrStandalone") or
+                    rec.get("xbrlAttachment", {}).get("consolidatedOrStandalone", "") or ""
+                ).strip().lower()
+                if consolidated and rtype in ("consolidated", "con", "c"):
                     filtered.append(rec)
-                elif not consolidated and rtype.lower() in ("standalone", "std", "s"):
+                elif not consolidated and rtype in ("standalone", "std", "s"):
                     filtered.append(rec)
             return filtered or records   # return all if filtering got nothing
 

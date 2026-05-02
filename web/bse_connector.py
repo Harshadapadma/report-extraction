@@ -128,6 +128,48 @@ _XBRL_FIELD_MAP: dict[str, str] = {
     "CapitalAndReserves":                   "Total Equity",
 }
 
+# ── FinancialResult4/w field map (ALL_CAPS keys used by BSE JSON API) ──────────
+# The /FinancialResult4/w endpoint returns different key names than the XBRL XML.
+# These are the actual keys BSE puts in its JSON response.
+_BSE_API_FIELD_MAP: dict[str, str] = {
+    # P&L — standard companies
+    "NET_SALES_INCOME":             "Revenue from Operations",
+    "TOTAL_INCOME_FROM_OPERATIONS": "Revenue from Operations",
+    "INCOME_FROM_OPERATIONS":       "Revenue from Operations",
+    "OTHER_INCOME":                 "Other Income",
+    "TOTAL_INCOME":                 "Total Revenue",
+    "TOTAL_EXPENDITURE":            "Total Expenses",
+    "PBDT":                         "Profit Before Depreciation & Tax",
+    "DEPRECIATION":                 "Depreciation and Amortisation",
+    "PROFIT_LOSS_BEFORE_TAX":       "Profit Before Tax",
+    "TAX":                          "Tax Expense",
+    "NET_PROFIT_LOSS":              "Profit After Tax",
+    "EPS_BASIC":                    "EPS (Basic)",
+    "EPS_DILUTED":                  "EPS (Diluted)",
+    # P&L — banking (RBI format)
+    "INTEREST_EARNED":              "Interest Income",
+    "INTEREST_EXPENDED":            "Interest Expended",
+    "NET_INTEREST_INCOME":          "Net Interest Income",
+    "OTHER_INCOME_BANK":            "Other Income",
+    "OPERATING_EXPENDITURE":        "Operating Expenses",
+    "PROVISIONS_CONTINGENCIES":     "Provisions and Contingencies",
+    "OPERATING_PROFIT":             "Operating Profit",
+    # Balance Sheet
+    "TOTAL_ASSETS":                 "Total Assets",
+    "NET_WORTH":                    "Total Equity",
+    "TOTAL_LIABILITIES":            "Total Liabilities",
+    "PAID_UP_CAPITAL":              "Share Capital",
+    "RESERVES_SURPLUS":             "Reserves and Surplus",
+    "LONG_TERM_BORROWINGS":         "Total Borrowings",
+    "TOTAL_BORROWINGS":             "Total Borrowings",
+    "CASH_AND_CASH_EQUIVALENTS":    "Cash and Cash Equivalents",
+    "FIXED_ASSETS":                 "Fixed Assets",
+    "INVESTMENTS":                  "Investments",
+    "DEPOSITS":                     "Deposits",
+    "ADVANCES":                     "Advances",
+    "BORROWINGS":                   "Total Borrowings",
+}
+
 
 # ── Quarter → fiscal year mapping ─────────────────────────────────────────────
 
@@ -228,28 +270,51 @@ class BSEConnector:
 
         year_set = set(years)
 
+        # Log first record keys so we can debug field-name mismatches
+        if records:
+            logger.info(f"BSEConnector: first record keys = {list(records[0].keys())[:20]}")
+
+        # Combined lookup: try both the XBRL tag map AND the API field-name map
+        _combined_map = {**_XBRL_FIELD_MAP, **_BSE_API_FIELD_MAP}
+
         for rec in records:
             try:
-                qend = rec.get("TO_DATE") or rec.get("QuarterEndDate", "")
+                qend = (
+                    rec.get("TO_DATE") or rec.get("TODATE") or
+                    rec.get("QuarterEndDate") or rec.get("quarter_end") or ""
+                )
                 fyear = _quarter_to_fyear(str(qend))
                 if not fyear or fyear not in year_set:
                     continue
 
-                stmt_type = rec.get("TypeFlag", "C")   # "C" or "S"
+                stmt_type = (
+                    rec.get("TypeFlag") or rec.get("TYPEFLAG") or
+                    rec.get("consolidatedOrStandalone") or "C"
+                )
 
-                for bse_key, tmpl_hint in _XBRL_FIELD_MAP.items():
-                    raw_val = rec.get(bse_key) or rec.get(bse_key.upper())
+                for field_key, tmpl_hint in _combined_map.items():
+                    # Try exact key, uppercase variant, and lowercase variant
+                    raw_val = (
+                        rec.get(field_key) or
+                        rec.get(field_key.upper()) or
+                        rec.get(field_key.lower())
+                    )
                     if raw_val is None:
+                        continue
+                    # Skip empty strings
+                    if isinstance(raw_val, str) and not raw_val.strip():
                         continue
                     val = _to_crore(raw_val, "crore")   # BSE reports in INR Crores
                     if val is None:
                         continue
                     bucket_key = f"{fyear}||{tmpl_hint}||{stmt_type}"
-                    year_buckets.setdefault(bucket_key, {}).setdefault("vals", []).append(val)
-                    year_buckets[bucket_key]["tmpl_hint"] = tmpl_hint
-                    year_buckets[bucket_key]["fyear"] = fyear
-                    year_buckets[bucket_key]["bse_key"] = bse_key
-                    year_buckets[bucket_key]["stmt_type"] = stmt_type
+                    if bucket_key not in year_buckets:
+                        year_buckets[bucket_key] = {
+                            "vals": [], "tmpl_hint": tmpl_hint,
+                            "fyear": fyear, "bse_key": field_key,
+                            "stmt_type": str(stmt_type),
+                        }
+                    year_buckets[bucket_key]["vals"].append(val)
 
             except Exception as e:
                 logger.debug(f"BSEConnector: error parsing record: {e}")

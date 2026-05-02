@@ -127,11 +127,38 @@ _SECTION_KW: dict[str, set[str]] = {
         "cash flow", "cash flows", "statement of cash",
         "operating activities", "investing activities", "financing activities",
     },
+    # ── Additional sections captured from Indian bank/NBFC annual reports ──────
+    "Operating Metrics": {
+        "key performance indicator", "financial highlight", "key financial indicator",
+        "key indicator", "performance highlight", "business highlight",
+        "asset quality", "capital adequacy", "crar",
+        "gnpa", "nnpa", "gross npa", "net npa",
+        "net interest margin", "nim", "return on asset", "return on equity",
+        "casa ratio", "loan book", "book value", "credit cost",
+        "provision coverage", "slippage", "cost to income",
+        "disbursement", "aum", "collection efficiency",
+    },
+    "Quarterly": {
+        "quarterly result", "quarter ended", "results for the quarter",
+        "unaudited result", "limited review",
+        # Note: do NOT add q1/q2/q3/q4 here — too common in table cells
+    },
 }
+
+# Order matters: check Operating Metrics BEFORE Balance Sheet
+# (some pages mention "total assets" in a KPI context, not as a BS heading)
+_SECTION_PRIORITY = [
+    "Annual P&L",
+    "Annual Cash Flow",
+    "Operating Metrics",
+    "Quarterly",
+    "Annual Balance Sheet",   # broadest catch-all last
+]
 
 def _classify_text(text: str) -> Optional[str]:
     t = text.lower()
-    for section, kws in _SECTION_KW.items():
+    for section in _SECTION_PRIORITY:
+        kws = _SECTION_KW.get(section, set())
         if any(kw in t for kw in kws):
             return section
     return None

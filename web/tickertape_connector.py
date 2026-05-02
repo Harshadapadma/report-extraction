@@ -190,21 +190,40 @@ class TickertapeConnector:
         symbol: str,
         stmt_type: str,
     ) -> Optional[dict]:
-        """Fetch one statement type from Tickertape API."""
+        """Fetch one statement type from Tickertape API.
+
+        Tries multiple URL / ticker formats because Tickertape has changed
+        their API structure over time.
+        """
         requests = _require_requests()
-        # Try annual period type
-        url = f"{_API_BASE}/{symbol.upper()}/financials"
-        params = {"type": stmt_type, "period": "annual"}
-        try:
-            resp = requests.get(url, params=params, headers=_HEADERS, timeout=_TIMEOUT)
-            if resp.status_code == 404:
-                return None
-            resp.raise_for_status()
-            data = resp.json()
-            return data
-        except Exception as e:
-            logger.debug(f"TickertapeConnector: {stmt_type} fetch failed for {symbol}: {e}")
-            return None
+        sym_upper = symbol.upper()
+
+        # URL candidates — Tickertape uses ":NSI" suffix for NSE symbols
+        url_candidates = [
+            (f"{_API_BASE}/{sym_upper}:NSI/financials",  {"type": stmt_type, "period": "annual"}),
+            (f"{_API_BASE}/{sym_upper}/financials",       {"type": stmt_type, "period": "annual"}),
+            (f"{_API_BASE}/{sym_upper}:NSI/financials",  {"period": "annual"}),
+            # Legacy endpoint used in some Tickertape integrations
+            (f"https://api.tickertape.in/stocks/{sym_upper}:NSI/financials/{stmt_type}", {"period": "annual"}),
+        ]
+
+        for url, params in url_candidates:
+            try:
+                resp = requests.get(url, params=params, headers=_HEADERS, timeout=_TIMEOUT)
+                if resp.status_code == 404:
+                    continue
+                if resp.status_code != 200:
+                    continue
+                data = resp.json()
+                # Quick sanity: must be a non-empty dict or list
+                if data and (isinstance(data, (dict, list))):
+                    logger.debug(f"TickertapeConnector: {stmt_type} OK via {url}")
+                    return data
+            except Exception as e:
+                logger.debug(f"TickertapeConnector: {url} — {e}")
+                continue
+
+        return None
 
     def _parse_statement(
         self,

@@ -62,6 +62,14 @@ def normalise_year(raw: str) -> Optional[str]:
             yr = "20" + yr
         return f"F{yr}"
 
+    # Pattern: FY2024-25 or FY2024-2025 (common in Indian Excel templates)
+    m = re.match(r"^fy(\d{4})[-/](\d{2,4})$", key, re.IGNORECASE)
+    if m:
+        end = m.group(2)
+        if len(end) == 2:
+            end = m.group(1)[:2] + end
+        return f"F{end}"
+
     # Pattern: 2024-25 or 2024-2025
     m = re.match(r"^(\d{4})[-/](\d{2,4})$", key)
     if m:
@@ -75,6 +83,29 @@ def normalise_year(raw: str) -> Optional[str]:
     if m:
         return f"F{m.group(1)}"
 
+    # Pattern: "Mar 2025" / "March 2025" (4-digit year) → annual F-year.
+    # "Mar-25" / "Mar 25" (2-digit year) falls through to normalise_quarter → 4QF2025.
+    # Heuristic: 4-digit year in an annual context means the fiscal year; 2-digit means quarter header.
+    m = re.match(r"^mar(?:ch)?[-\s](\d{4})$", key, re.IGNORECASE)
+    if m:
+        return f"F{m.group(1)}"
+
+    # Pattern: "F.Y. 2025" / "F.Y.2025" / "F.Y.25" — dotted abbreviation in templates
+    m = re.match(r"^f\.y\.?\s*(\d{2,4})$", key, re.IGNORECASE)
+    if m:
+        yr = m.group(1)
+        if len(yr) == 2:
+            yr = "20" + yr
+        return f"F{yr}"
+
+    # Pattern: "F.Y. 2024-25" / "F.Y.2024-25"
+    m = re.match(r"^f\.y\.?\s*(\d{4})[-/](\d{2,4})$", key, re.IGNORECASE)
+    if m:
+        end = m.group(2)
+        if len(end) == 2:
+            end = m.group(1)[:2] + end
+        return f"F{end}"
+
     # Pattern: plain 4-digit year 2025 — only accept plausible fiscal years
     m = re.match(r"^(\d{4})$", key)
     if m:
@@ -82,6 +113,81 @@ def normalise_year(raw: str) -> Optional[str]:
         if 2000 <= yr <= 2040:
             return f"F{yr}"
         return None   # reject e.g. "1000", "9999", "1234"
+
+    # Last resort: try quarterly period (e.g. "Mar-25" → "4QF2025")
+    # This allows read_template_structure to recognise quarter column headers in templates.
+    return normalise_quarter(raw)
+
+
+# ── Quarter normalisation ──────────────────────────────────────────────────────
+
+# Month → (quarter_num, add_year):
+#   Q1 = Apr/May/Jun  (FY starts Apr, add_year=1 to convert calendar year → FY)
+#   Q2 = Jul/Aug/Sep  (add_year=1)
+#   Q3 = Oct/Nov/Dec  (add_year=1)
+#   Q4 = Jan/Feb/Mar  (add_year=0 — same calendar year as FY end)
+_MONTH_TO_QTR: dict[str, tuple[int, int]] = {
+    "jan": (4, 0), "feb": (4, 0), "mar": (4, 0),
+    "apr": (1, 1), "may": (1, 1), "jun": (1, 1),
+    "jul": (2, 1), "aug": (2, 1), "sep": (2, 1),
+    "oct": (3, 1), "nov": (3, 1), "dec": (3, 1),
+}
+
+
+def normalise_quarter(raw: str) -> Optional[str]:
+    """
+    Convert a raw quarterly period string to the canonical ``NQF YYYY`` format.
+
+    Examples
+    --------
+    "Mar-25"   -> "4QF2025"
+    "Jun-24"   -> "1QF2025"   (Jun 2024 is Q1 of FY2025)
+    "Sep 2024" -> "2QF2025"
+    "Dec 2024" -> "3QF2025"
+    "Q4FY25"   -> "4QF2025"
+    "Q1FY24"   -> "1QF2024"
+    "1QF2025"  -> "1QF2025"   (already canonical)
+    Returns None if the string is not recognisable as a quarter.
+    """
+    if not raw:
+        return None
+    t = raw.strip().lower()
+
+    # Already canonical: "1QF2025" / "4QF2025"
+    m = re.match(r"^(\d)qf(\d{4})$", t)
+    if m:
+        return f"{m.group(1)}QF{m.group(2)}"
+
+    # Q4FY25 / Q1FY2024 / "Q4 FY25" style
+    m = re.match(r"^q(\d)\s*fy\s*(\d{2,4})$", t)
+    if m:
+        q  = m.group(1)
+        yr = m.group(2)
+        yr = ("20" + yr) if len(yr) == 2 else yr
+        return f"{q}QF{yr}"
+
+    # 4QFY25 / 1QFY2024 style (digit+Q then FY)
+    m = re.match(r"^(\d)q\s*fy\s*(\d{2,4})$", t)
+    if m:
+        q  = m.group(1)
+        yr = m.group(2)
+        yr = ("20" + yr) if len(yr) == 2 else yr
+        return f"{q}QF{yr}"
+
+    # Month[-/space]YY or Month[-/space]YYYY: "Mar-25", "Jun 24", "Sep 2024"
+    m = re.match(
+        r"^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)"
+        r"[-\s](\d{2,4})$",
+        t,
+    )
+    if m:
+        mon    = m.group(1)
+        yr_raw = m.group(2)
+        yr_int = int(yr_raw) if len(yr_raw) == 4 else (
+            2000 + int(yr_raw) if int(yr_raw) < 50 else 1900 + int(yr_raw)
+        )
+        q_num, add_yr = _MONTH_TO_QTR[mon]
+        return f"{q_num}QF{yr_int + add_yr}"
 
     return None
 

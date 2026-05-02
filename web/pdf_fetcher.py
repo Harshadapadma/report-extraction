@@ -438,8 +438,26 @@ def download_pdf(url: str, progress_cb=None) -> Optional[bytes]:
     """
     requests = _get_requests()
 
+    def _extract_pdf_from_zip(data: bytes) -> Optional[bytes]:
+        """If data is a ZIP archive, extract the largest PDF inside it."""
+        try:
+            import zipfile
+            with zipfile.ZipFile(io.BytesIO(data)) as zf:
+                pdf_names = [n for n in zf.namelist() if n.lower().endswith(".pdf")]
+                if not pdf_names:
+                    return None
+                # Pick the largest PDF (likely the annual report, not a cover letter)
+                pdf_names.sort(key=lambda n: zf.getinfo(n).file_size, reverse=True)
+                pdf_bytes = zf.read(pdf_names[0])
+                if pdf_bytes.startswith(b"%PDF"):
+                    logger.info(f"pdf_fetcher: extracted {pdf_names[0]} from ZIP ({len(pdf_bytes)//1024} KB)")
+                    return pdf_bytes
+        except Exception as e:
+            logger.debug(f"pdf_fetcher: zip extraction failed: {e}")
+        return None
+
     def _stream(resp) -> Optional[bytes]:
-        """Read a streaming response and return bytes, or None if not a PDF."""
+        """Read a streaming response and return bytes, or None if not a PDF/ZIP."""
         total = int(resp.headers.get("Content-Length", 0))
         chunks = []
         downloaded = 0
@@ -450,7 +468,12 @@ def download_pdf(url: str, progress_cb=None) -> Optional[bytes]:
                 if progress_cb:
                     progress_cb(downloaded, total)
         data = b"".join(chunks)
-        return data if data.startswith(b"%PDF") else None
+        if data.startswith(b"%PDF"):
+            return data
+        # NSE sometimes packages annual reports as ZIP files containing a PDF
+        if data[:4] == b"PK\x03\x04":
+            return _extract_pdf_from_zip(data)
+        return None
 
     # Per-strategy connect+read timeouts (connect_timeout, read_timeout).
     # Using a tuple prevents hanging when server accepts connection but never sends data.
@@ -502,10 +525,15 @@ def download_pdf(url: str, progress_cb=None) -> Optional[bytes]:
 # ── Investor Presentation helpers ────────────────────────────────────────────
 
 # Patterns that positively identify investor / analyst presentations.
+# NOTE: use .{0,4} instead of .? so we handle "Investors' Presentation",
+# "Investor's Presentation", "Investors Presentation" etc.
 _PRESENTATION_CONFIRM = re.compile(
-    r"investor.?present|analyst.?day|investor.?day|investor.?meet"
-    r"|investor.?brief|investor.?update|corporate.?present"
-    r"|fact.?sheet|investor.?deck|quarterly.?update",
+    r"investor.{0,4}present|analyst.{0,4}(day|present|meet|brief)"
+    r"|investor.{0,4}(day|meet|brief|update|deck|call)"
+    r"|corporate.{0,4}present|results?.{0,4}present|earnings.{0,4}present"
+    r"|quarterly.{0,4}(update|present|deck)|fact.{0,4}sheet"
+    r"|investor.{0,4}relation.{0,10}present|ir.{0,4}present"
+    r"|q[1-4].{0,10}(present|update|deck)|fy\d{2}.{0,10}present",
     re.I,
 )
 
@@ -723,6 +751,27 @@ def _get_company_website(symbol: str, bse_code: Optional[str] = None) -> Optiona
     def _cache_and_return(url: Optional[str]) -> Optional[str]:
         _website_cache[cache_key] = url
         return url
+
+    # ── 0. NSE quote-equity API — best source, returns JSON with website field ──
+    try:
+        nse_s  = _nse_session.get()
+        resp   = nse_s.get(
+            f"{_NSE_API}/quote-equity",
+            params={"symbol": symbol.upper()},
+            headers=_API_HEADERS,
+            timeout=_TIMEOUT,
+        )
+        if resp.status_code == 200:
+            data   = resp.json()
+            info   = data.get("info", data)
+            for key in ("companyWebSite", "website", "companyWebsite",
+                        "officialSite", "Website", "companyWeb"):
+                site = info.get(key, "")
+                if site and str(site).startswith("http"):
+                    logger.info(f"pdf_fetcher: company website from NSE quote-equity: {site}")
+                    return _cache_and_return(str(site).rstrip("/"))
+    except Exception as e:
+        logger.debug(f"pdf_fetcher: NSE quote-equity website lookup failed: {e}")
 
     # ── 1. yfinance — works from cloud/server IPs, no scraping needed ─────────
     try:
@@ -1364,48 +1413,92 @@ def _parse_xbrl_xml(xml_bytes: bytes, years: Optional[list] = None) -> dict:
     """
     import xml.etree.ElementTree as ET
 
-    # Map of XBRL local tag names (case-insensitive) → template label
+    # Map of XBRL local tag names (case-insensitive, stripped of namespace) → template label
+    # Banking-specific tags follow RBI Schedule 13-18 naming conventions.
     _XBRL_TAG_MAP: dict[str, str] = {
-        # P&L
-        "interestearned":             "Interest Income",
-        "interestincome":             "Interest Income",
-        "interestexpended":           "Interest Expended",
-        "netinterestincome":          "Net Interest Income",
-        "otheroperatingrevenue":      "Other Income",
-        "otherincome":                "Other Income",
-        "totalrevenuefromoperations": "Revenue from Operations",
-        "revenuefromoperations":      "Revenue from Operations",
-        "totalrevenue":               "Total Revenue",
-        "operatingexpenditure":       "Operating Expenses",
-        "employeecost":               "Employee Expenses",
-        "provisions":                 "Provisions and Contingencies",
-        "provisionandcontingencies":  "Provisions and Contingencies",
-        "operatingprofit":            "Operating Profit",
-        "profitbeforetax":            "Profit Before Tax",
-        "taxexpense":                 "Tax Expense",
-        "profitaftertax":             "Profit After Tax",
-        "profitfortheperiod":         "Profit After Tax",
-        "earningspersharebasic":      "EPS (Basic)",
-        "basicearningspershare":      "EPS (Basic)",
-        "earningspersharediluted":    "EPS (Diluted)",
-        # Balance Sheet
-        "deposits":                   "Deposits",
-        "advances":                   "Advances",
-        "investments":                "Investments",
-        "borrowings":                 "Total Borrowings",
-        "capitalandreserves":         "Total Equity",
-        "reservesandsurplus":         "Reserves and Surplus",
-        "sharecapital":               "Share Capital",
-        "totalassets":                "Total Assets",
-        "cashandcashequivalents":     "Cash and Cash Equivalents",
-        "cashandbalancewithrbi":      "Cash and Balance with RBI",
-        # Asset Quality
-        "grossnpa":                   "Gross NPA",
-        "grossnonperformingassets":   "Gross NPA",
-        "netnonperformingassets":     "Net NPA",
-        "netnpa":                     "Net NPA",
-        "gnparatio":                  "Gross NPA %",
-        "nnparatio":                  "Net NPA %",
+        # ── P&L — Interest ──────────────────────────────────────────────────────
+        "interestearned":                      "Interest Income",
+        "interestincome":                      "Interest Income",
+        "incomeonadvances":                    "Interest Income",
+        "interestexpended":                    "Interest Expended",
+        "interestexpense":                     "Interest Expended",
+        "netinterestincome":                   "Net Interest Income",
+        # ── P&L — Other income ──────────────────────────────────────────────────
+        "otheroperatingrevenue":               "Other Income",
+        "otherincome":                         "Other Income",
+        "feeincome":                           "Other Income",
+        "totalrevenuefromoperations":          "Revenue from Operations",
+        "revenuefromoperations":               "Revenue from Operations",
+        "totalrevenue":                        "Total Revenue",
+        "totalincome":                         "Total Revenue",
+        # ── P&L — Operating expenses (two distinct sub-lines for banks) ────────
+        # Schedule 16 (i): Payments to employees  → "Employee expenses"
+        "paymentstoandfprovisionforemployees": "Employee Expenses",
+        "paymentstoandfemployees":             "Employee Expenses",
+        "employeebenefitexpense":              "Employee Expenses",
+        "staffexpenses":                       "Employee Expenses",
+        "employeecost":                        "Employee Expenses",
+        "salarywagesandallowances":            "Employee Expenses",
+        # Schedule 16 (ii): Other operating expenses → "Operating expenses"
+        "otheroperatingexpenses":              "Operating Expenses",
+        "operatingexpenses":                   "Operating Expenses",
+        "operatingexpenditure":                "Operating Expenses",
+        "rentleasestaxes":                     "Operating Expenses",          # sub-item proxy
+        # Total opex (both sub-lines combined — only use if neither above matched)
+        "totaloperatingexpenses":              "Total Operating Expenses",    # NOT mapped to template col
+        # ── P&L — Provisions / credit cost ─────────────────────────────────────
+        "provisions":                          "Provisions and Contingencies",
+        "provisionandcontingencies":           "Provisions and Contingencies",
+        "provisionsandcontingencies":          "Provisions and Contingencies",
+        "provisionfornonperformingassets":     "Provisions and Contingencies",
+        "creditcost":                          "Provisions and Contingencies",
+        # ── P&L — Profit lines ──────────────────────────────────────────────────
+        "operatingprofit":                     "Operating Profit",
+        "preprovisioningoperatingprofit":      "Pre-provisioning Operating Profit",
+        "ppop":                                "Pre-provisioning Operating Profit",
+        "profitbeforetax":                     "Profit Before Tax",
+        "profitbeforeincometax":               "Profit Before Tax",
+        "taxexpense":                          "Tax Expense",
+        "incometaxexpense":                    "Tax Expense",
+        "profitaftertax":                      "Profit After Tax",
+        "profitfortheyear":                    "Profit After Tax",
+        "profitfortheperiod":                  "Profit After Tax",
+        "netprofit":                           "Profit After Tax",
+        "earningspersharebasic":               "EPS (Basic)",
+        "basicearningspershare":               "EPS (Basic)",
+        "earningspersharediluted":             "EPS (Diluted)",
+        "dilutedearningspershare":             "EPS (Diluted)",
+        # ── Balance Sheet ────────────────────────────────────────────────────────
+        "deposits":                            "Deposits",
+        "advances":                            "Advances",
+        "investments":                         "Investments",
+        "borrowings":                          "Total Borrowings",
+        "capitalandreserves":                  "Total Equity",
+        "reservesandsurplus":                  "Reserves and Surplus",
+        "sharecapital":                        "Share Capital",
+        "totalassets":                         "Total Assets",
+        "balancesheetsize":                    "Total Assets",
+        "cashandcashequivalents":              "Cash and Cash Equivalents",
+        "cashandbalancewithrbi":               "Cash and Balance with RBI",
+        # ── Asset Quality ─────────────────────────────────────────────────────────
+        "grossnpa":                            "Gross NPA",
+        "grossnonperformingassets":            "Gross NPA",
+        "grossnpassets":                       "Gross NPA",
+        "netnonperformingassets":              "Net NPA",
+        "netnpa":                              "Net NPA",
+        "netnonperformingadvances":            "Net NPA",
+        "gnparatio":                           "Gross NPA %",
+        "grossnparatio":                       "Gross NPA %",
+        "nnparatio":                           "Net NPA %",
+        "netnparatio":                         "Net NPA %",
+        "provisioncoverageratio":              "PCR %",
+        # ── Key Ratios ───────────────────────────────────────────────────────────
+        "returnonassets":                      "ROA",
+        "returnonequity":                      "ROE",
+        "netinterestmargin":                   "NIM",
+        "capitaladequacyratio":                "CRAR",
+        "tier1capitalratio":                   "Tier 1 Ratio",
+        "tier2capitalratio":                   "Tier 2 Ratio",
     }
 
     year_set = set(years) if years else None
@@ -1418,54 +1511,127 @@ def _parse_xbrl_xml(xml_bytes: bytes, years: Optional[list] = None) -> dict:
 
     ns_re = re.compile(r"\{[^}]+\}")   # strip {namespace} prefix
 
-    # ── Parse contexts: contextId → fy_label ──────────────────────────────────
-    # XBRL dates are always YYYY-MM-DD — use _infer_fy_from_dates (not _infer_fy_from_text
-    # which mis-parses "2025-03" as year 2003).
-    contexts: dict[str, str] = {}
+    # ── Parse contexts: contextId → (fy_label, duration_months) ──────────────
+    # XBRL dates are always YYYY-MM-DD.
+    # For Q4 filings, there are TWO period types that end on the same March 31:
+    #   • Full year:   startDate=2024-04-01, endDate=2025-03-31  → 12-month duration
+    #   • Q4 quarter:  startDate=2025-01-01, endDate=2025-03-31  → 3-month duration
+    # We track duration so that when a label has both, we prefer the 12-month (annual) value.
+    from datetime import datetime
+
+    def _duration_months(start: str, end: str) -> int:
+        """Approximate number of months between two YYYY-MM-DD strings."""
+        try:
+            s = datetime.strptime(start.strip(), "%Y-%m-%d")
+            e = datetime.strptime(end.strip(),   "%Y-%m-%d")
+            return (e.year - s.year) * 12 + (e.month - s.month)
+        except Exception:
+            return 0
+
+    # contexts maps ctx_id → (fy_label, duration_months)
+    contexts: dict[str, tuple[str, int]] = {}
 
     for ctx in root.iter():
         if ns_re.sub("", ctx.tag).lower() != "context":
             continue
-        ctx_id   = ctx.get("id", "")
-        end_date = ""
+        ctx_id     = ctx.get("id", "")
+        start_date = ""
+        end_date   = ""
         for child in ctx:
             if ns_re.sub("", child.tag).lower() == "period":
                 for gc in child:
-                    if ns_re.sub("", gc.tag).lower() in ("enddate", "instant"):
+                    gtag = ns_re.sub("", gc.tag).lower()
+                    if gtag == "startdate":
+                        start_date = (gc.text or "").strip()
+                    elif gtag in ("enddate", "instant"):
                         end_date = (gc.text or "").strip()
-                        break
                 break
         if end_date:
-            fy = _infer_fy_from_dates("", end_date)   # YYYY-MM-DD → FY label
+            fy = _infer_fy_from_dates("", end_date)
             if fy:
-                contexts[ctx_id] = fy
+                dur = _duration_months(start_date, end_date) if start_date else 0
+                contexts[ctx_id] = (fy, dur)
 
     if not contexts:
         logger.warning("xbrl_parser: no contexts parsed — XBRL structure may differ")
         return {}
 
     # ── Detect reporting unit ─────────────────────────────────────────────────
-    # Indian XBRL filings typically report in INR lakhs.
-    # Scan for explicit unit declarations; auto-detect from magnitude as fallback.
-    multiplier = 0.01   # default: lakhs → crores
+    # Indian NSE/BSE XBRL filings use two conventions:
+    #   A) Values in actual INR Rupees with unit="iso4217:INR"   → 1e-7 multiplier
+    #   B) Values in INR Lakhs with unit="INR" and custom scale  → 0.01 multiplier
+    #   C) Values already in Crores                              → 1.0 multiplier
+    #
+    # Strategy:
+    #  1. Look for explicit currency label declarations (measure, ScaleOfPresentation, etc.)
+    #  2. Fall back: inspect `decimals` attribute of the FIRST numeric fact element.
+    #     NSE XBRL in rupees → decimals="-5" or "-7" (rounded to lakh/crore precision)
+    #     NSE XBRL in lakhs  → decimals="-2" or  "0" (rounded to hundred lakhs)
+    #  3. Auto-detect from actual value magnitudes as final fallback.
+
+    multiplier = 0.01   # conservative default: lakhs → crores
+
+    _scale_found = False
     for elem in root.iter():
         local = ns_re.sub("", elem.tag).lower()
         text  = (elem.text or "").strip().lower()
         if not text:
             continue
-        if local in ("measure", "unit", "reportingcurrencyunit"):
+        if local in ("measure", "unit", "reportingcurrencyunit",
+                     "scaleofpresentation", "unitnumerator", "scalefactor"):
             if "crore" in text:
                 multiplier = 1.0
-            elif "lakh" in text or "hundredthousand" in text:
+                _scale_found = True
+            elif "lakh" in text or "hundredthousand" in text or "100000" in text:
                 multiplier = 0.01
+                _scale_found = True
             elif "million" in text:
                 multiplier = 0.1
-            elif "rupee" in text or "inr" in text:
-                # Raw rupees — divide by 10 million to get crores
+                _scale_found = True
+            elif "thousand" in text and "hundred" not in text:
+                multiplier = 1e-4
+                _scale_found = True
+            elif "iso4217:inr" in text or text == "inr" or "rupee" in text:
+                # Raw rupees — divide by 10 million (1 crore = 10^7 rupees)
                 multiplier = 1e-7
+                _scale_found = True
+            if _scale_found:
+                break
+
+    # Fallback: inspect `decimals` attribute on first meaningful numeric fact
+    if not _scale_found:
+        for elem in root.iter():
+            decimals_attr = elem.get("decimals", "")
+            raw_text = (elem.text or "").strip().replace(",", "")
+            if not decimals_attr or not raw_text:
+                continue
+            try:
+                val     = float(raw_text)
+                dec_int = int(decimals_attr)
+            except (ValueError, TypeError):
+                continue
+            if val == 0:
+                continue
+            # `decimals=-5` in a pure-rupee filing → value precision is ±100,000 (1 lakh)
+            # Real magnitude is just the raw number (e.g., 12,345,678,900 rupees)
+            # `decimals=-2` in a lakh filing → value precision is ±100 (lakhs)
+            # Use the combination of actual value size + decimals to determine:
+            if dec_int <= -6 and abs(val) > 1e7:
+                multiplier = 1e-7   # raw rupees
+            elif dec_int <= -4 and abs(val) > 1e4:
+                multiplier = 1e-7   # likely rupees
+            elif dec_int >= -2 and abs(val) < 1e7:
+                multiplier = 0.01   # likely lakhs
+            else:
+                multiplier = 0.01   # safe default
+            _scale_found = True
+            break
 
     # ── Parse fact elements ────────────────────────────────────────────────────
-    result: dict[str, dict[str, float]] = {}
+    # For each (label, fy) pair, prefer the value from the LONGEST duration context.
+    # This ensures Q4 annual figures (12-month) win over Q4 quarterly figures (3-month).
+    # result structure: {label: {fy: (value, duration_months)}}
+    _raw: dict[str, dict[str, tuple[float, int]]] = {}
 
     for elem in root.iter():
         local          = ns_re.sub("", elem.tag).lower()
@@ -1473,9 +1639,12 @@ def _parse_xbrl_xml(xml_bytes: bytes, years: Optional[list] = None) -> dict:
         if not template_label:
             continue
 
-        ctx_ref = elem.get("contextRef", "")
-        fy      = contexts.get(ctx_ref)
-        if not fy or (year_set and fy not in year_set):
+        ctx_ref  = elem.get("contextRef", "")
+        ctx_info = contexts.get(ctx_ref)
+        if not ctx_info:
+            continue
+        fy, dur = ctx_info
+        if year_set and fy not in year_set:
             continue
 
         raw_text = (elem.text or "").strip().replace(",", "")
@@ -1488,9 +1657,17 @@ def _parse_xbrl_xml(xml_bytes: bytes, years: Optional[list] = None) -> dict:
         except (ValueError, OverflowError):
             continue
 
-        label_data = result.setdefault(template_label, {})
-        if fy not in label_data:    # keep first value per label+year
-            label_data[fy] = val_crore
+        label_data = _raw.setdefault(template_label, {})
+        existing   = label_data.get(fy)
+        # Keep the value from the longest-duration context (prefer annual over quarterly)
+        if existing is None or dur > existing[1]:
+            label_data[fy] = (val_crore, dur)
+
+    # Flatten to {label: {fy: value}}
+    result: dict[str, dict[str, float]] = {
+        lbl: {fy: val for fy, (val, _dur) in yr_map.items()}
+        for lbl, yr_map in _raw.items()
+    }
 
     logger.info(f"xbrl_parser: extracted {len(result)} fields from XBRL")
     return result
@@ -1532,6 +1709,73 @@ def fetch_xbrl_from_url(url: str, years: Optional[list] = None) -> dict:
     return _parse_xbrl_xml(content, years)
 
 
+def _fetch_qresults_from_nse_announcements(symbol: str) -> list[dict]:
+    """
+    Fallback: fetch quarterly result PDFs from NSE corporate-announcements endpoint
+    (same endpoint used for investor presentations — reliable cookie-wise).
+    Filters announcements whose subject/desc contains "Financial Results".
+    """
+    session = _nse_session.get()
+    all_results: list[dict] = []
+    seen_urls: set[str] = set()
+
+    _FIN_RESULT_RE = re.compile(
+        r"financial\s+results?|quarterly\s+results?|unaudited\s+results?|audited\s+results?",
+        re.I,
+    )
+
+    try:
+        resp = session.get(
+            f"{_NSE_API}/corporate-announcements",
+            params={"index": "equities", "symbol": symbol.upper()},
+            headers=_API_HEADERS,
+            timeout=_TIMEOUT,
+        )
+        if resp.status_code != 200:
+            return []
+        records = resp.json() if isinstance(resp.json(), list) else resp.json().get("data", [])
+        if not isinstance(records, list):
+            return []
+    except Exception:
+        return []
+
+    for rec in records:
+        subject = str(rec.get("subject") or rec.get("desc") or "")
+        if not _FIN_RESULT_RE.search(subject):
+            continue
+        # Skip investor presentations that match financial keywords accidentally
+        if re.search(r"investor\s+present|analyst", subject, re.I):
+            continue
+
+        an_body = rec.get("attchmntFile") or rec.get("attachment") or rec.get("attachmentURL") or ""
+        if not an_body:
+            continue
+        link = an_body if an_body.startswith("http") else f"https://nsearchives.nseindia.com/{an_body.lstrip('/')}"
+        if link in seen_urls:
+            continue
+        seen_urls.add(link)
+
+        period = str(rec.get("bm_desc") or rec.get("period") or rec.get("dispDt") or "")
+        year_label = _infer_fy_from_text(link + " " + period + " " + subject)
+        quarter    = _infer_quarter(period) or _infer_quarter(subject) or _infer_quarter(link)
+        filename   = link.split("/")[-1].split("?")[0] or f"{symbol}_qresult.pdf"
+
+        all_results.append({
+            "year":      year_label,
+            "quarter":   quarter,
+            "is_annual": quarter == "Q4",
+            "filename":  filename,
+            "url":       link,
+            "xbrl_url":  None,
+            "size_mb":   0,
+            "source":    "NSE-announcements",
+        })
+
+    all_results.sort(key=lambda r: (r["year"] or "", r["quarter"] or ""), reverse=True)
+    logger.info(f"pdf_fetcher: NSE-announcements fallback found {len(all_results)} quarterly results for {symbol}")
+    return all_results
+
+
 def get_available_quarterly_results(
     symbol: str,
     bse_code: Optional[str] = None,
@@ -1539,10 +1783,11 @@ def get_available_quarterly_results(
     """
     Return all available quarterly financial result PDF links, newest-first.
 
-    Sources tried:
-      1. NSE financial-results API  (pdfLink per quarter)
-      2. BSE FinancialResult4 API   (PDFLINKURL per quarter)
-      3. Company IR page            (generic scraper, most reliable for recent)
+    Sources tried (in order):
+      1. NSE financial-results API  (pdfLink per quarter + xbrlLink)
+      2. NSE corporate-announcements filtered for "Financial Results" (reliable fallback)
+      3. BSE FinancialResult4 API   (PDFLINKURL per quarter)
+      4. Company IR page            (generic scraper)
     """
     seen_urls: set[str] = set()
     all_results: list[dict] = []
@@ -1551,6 +1796,13 @@ def get_available_quarterly_results(
         if rep["url"] not in seen_urls:
             all_results.append(rep)
             seen_urls.add(rep["url"])
+
+    # If primary NSE financial-results API returned nothing, try announcements fallback
+    if not all_results:
+        for rep in _fetch_qresults_from_nse_announcements(symbol):
+            if rep["url"] not in seen_urls:
+                all_results.append(rep)
+                seen_urls.add(rep["url"])
 
     if bse_code:
         for rep in fetch_bse_quarterly_result_pdfs(bse_code):
@@ -1581,15 +1833,31 @@ def get_report_for_year(
     """
     Find the best available annual report download link for a given FY.
     Returns the report dict {year, filename, url, size_mb} or None.
+
+    Order of preference:
+      1. Company's own IR page  (direct PDFs — no zips, best quality)
+      2. NSE
+      3. BSE
+      4. Screener
     """
-    # Try NSE first
+    # ── 1. Company's own IR page first (direct PDFs, not zip-packaged) ──────
+    try:
+        company_reports = fetch_company_annual_reports(symbol, bse_code)
+        for rep in company_reports:
+            if rep["year"] == fy_label:
+                logger.info(f"pdf_fetcher: found {fy_label} report on company IR: {rep['filename']}")
+                return rep
+    except Exception:
+        pass
+
+    # ── 2. NSE ───────────────────────────────────────────────────────────────
     nse_reports = fetch_nse_report_list(symbol)
     for rep in nse_reports:
         if rep["year"] == fy_label:
             logger.info(f"pdf_fetcher: found {fy_label} report on NSE: {rep['filename']}")
             return rep
 
-    # Try BSE
+    # ── 3. BSE ───────────────────────────────────────────────────────────────
     if bse_code:
         bse_reports = fetch_bse_report_list(bse_code)
         for rep in bse_reports:
@@ -1597,20 +1865,12 @@ def get_report_for_year(
                 logger.info(f"pdf_fetcher: found {fy_label} report on BSE: {rep['filename']}")
                 return rep
 
-    # Try Screener links
+    # ── 4. Screener ──────────────────────────────────────────────────────────
     screener_reports = fetch_screener_report_links(symbol)
     for rep in screener_reports:
         if rep["year"] == fy_label:
             logger.info(f"pdf_fetcher: found {fy_label} report on Screener: {rep['filename']}")
             return rep
-
-    # Final fallback: company's own IR page
-    if bse_code:
-        company_reports = fetch_company_annual_reports(symbol, bse_code)
-        for rep in company_reports:
-            if rep["year"] == fy_label:
-                logger.info(f"pdf_fetcher: found {fy_label} report on company IR: {rep['filename']}")
-                return rep
 
     logger.info(f"pdf_fetcher: no report found for {symbol} {fy_label}")
     return None
