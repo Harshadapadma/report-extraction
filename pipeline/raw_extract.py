@@ -30,6 +30,57 @@ from pipeline.llm_fill import (
     _pdf_to_markdown, _build_toc, PDFClassification,
 )
 
+
+def _extract_tables_via_fitz(pdf_path: str, page_idxs: list[int]
+                              ) -> list[list[list[str]]]:
+    """Extract tables from specific pages using PyMuPDF's find_tables().
+    Returns list of tables (each as list of rows of strings). Preserves
+    label column much better than pdfplumber on magazine-layout PDFs.
+    """
+    out: list[list[list[str]]] = []
+    try:
+        import fitz   # PyMuPDF
+    except ImportError:
+        return out
+    try:
+        doc = fitz.open(pdf_path)
+    except Exception:
+        return out
+    try:
+        for pn in page_idxs:
+            if pn < 0 or pn >= len(doc):
+                continue
+            page = doc[pn]
+            try:
+                finder = page.find_tables()
+                tables = finder.tables if hasattr(finder, "tables") else list(finder)
+            except Exception:
+                tables = []
+            for tbl in tables:
+                try:
+                    rows = tbl.extract()
+                    if not rows or len(rows) < 2:
+                        continue
+                    # Normalise: ensure strings, strip None
+                    norm = []
+                    for r in rows:
+                        norm.append([
+                            ("" if c is None else str(c).strip().replace("\n", " "))
+                            for c in r
+                        ])
+                    # Filter: need ≥3 rows AND meaningful content
+                    n_nums = sum(
+                        1 for r in norm for c in r
+                        if c and re.search(r"\d", c)
+                    )
+                    if len(norm) >= 3 and n_nums >= 3:
+                        out.append(norm)
+                except Exception as exc:
+                    logger.debug(f"fitz table extract failed page {pn}: {exc}")
+    finally:
+        doc.close()
+    return out
+
 logger = logging.getLogger(__name__)
 
 
@@ -408,13 +459,26 @@ def raw_extract_statements(
                     continue
                 page_idxs = scopes_pages[sc_label]
                 tables_collected: list[list[list[str]]] = []
-                for pn in sorted(page_idxs):
-                    tables = _extract_md_tables_from_page(md_pages.get(pn, ""))
-                    for tbl in tables:
-                        n_numeric = sum(1 for r in tbl for c in r
-                                        if _try_parse_num(c) is not None)
-                        if len(tbl) >= 3 and n_numeric >= 5:
-                            tables_collected.append(tbl)
+
+                # PRIMARY: PyMuPDF find_tables() — preserves label column
+                # on magazine-layout PDFs that mangle pdfplumber.
+                pdf_path = getattr(cls, "path", None) or cls.name
+                if pdf_path and os.path.exists(pdf_path):
+                    fitz_tables = _extract_tables_via_fitz(
+                        pdf_path, sorted(page_idxs)
+                    )
+                    tables_collected.extend(fitz_tables)
+
+                # FALLBACK: parse from cached .md if fitz returns nothing
+                if not tables_collected:
+                    for pn in sorted(page_idxs):
+                        tables = _extract_md_tables_from_page(md_pages.get(pn, ""))
+                        for tbl in tables:
+                            n_numeric = sum(1 for r in tbl for c in r
+                                            if _try_parse_num(c) is not None)
+                            if len(tbl) >= 3 and n_numeric >= 5:
+                                tables_collected.append(tbl)
+
                 if not tables_collected:
                     continue
                 row_cursor = _write_block(ws, row_cursor, sc_label,
