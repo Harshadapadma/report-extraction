@@ -47,6 +47,8 @@ _STMT_PATTERNS = [
     (r"statement of (?:profit|p&l)|p\s*&\s*l|\bp&l\b", "P&L"),
     (r"cash flow", "Cash Flow"),
     (r"statement of changes in equity|equity reconciliation", "Equity"),
+    (r"segment (?:reporting|information|disclosure)|"
+     r"primary segment|secondary segment|business segment", "Segment Reporting"),
 ]
 
 
@@ -71,13 +73,18 @@ def _short_pdf_id(name: str) -> str:
 
 
 def _extract_md_tables_from_page(md_page_text: str) -> list[list[list[str]]]:
-    """Parse markdown tables from a single page's md text."""
+    """Parse markdown tables from a single page's md text.
+
+    Also recovers labels for rows where the first column is empty by
+    looking at the most recent non-empty cell in the same column position
+    across earlier rows of the same table (carry-forward). This handles
+    tables where every other row leaves the label blank to visually group
+    sub-items under a parent."""
     tables: list[list[list[str]]] = []
     lines = md_page_text.split("\n")
     i = 0
     while i < len(lines):
         line = lines[i].strip()
-        # Markdown table: |...| then |---|---|
         if (line.startswith("|") and line.endswith("|")
                 and i + 1 < len(lines)
                 and re.match(r"\|[\s\-:|]+\|", lines[i + 1].strip())):
@@ -89,6 +96,42 @@ def _extract_md_tables_from_page(md_page_text: str) -> list[list[list[str]]]:
                 row = [c.strip() for c in lines[j].strip().strip("|").split("|")]
                 tbl.append(row)
                 j += 1
+            # Post-process: fill empty label column by looking at the most-
+            # recent non-empty value in the same column. This recovers
+            # labels that pymupdf4llm leaves blank for continuation rows.
+            if len(tbl) >= 3:
+                # Decide which column is the "label" column. Usually col 0,
+                # but if col 0 is all-numeric and col 1 is mostly text, use col 1.
+                def _is_numeric(s):
+                    s = (s or "").strip().replace(",", "").replace(" ", "")
+                    if not s: return False
+                    s = s.strip("()").lstrip("-")
+                    try:
+                        float(s); return True
+                    except ValueError:
+                        return False
+                col0_text_count = sum(1 for r in tbl[1:]
+                                       if r and r[0] and not _is_numeric(r[0]))
+                if col0_text_count >= 2:
+                    label_col = 0
+                else:
+                    # Maybe labels are in col 1
+                    has_col1 = all(len(r) > 1 for r in tbl[1:])
+                    if has_col1:
+                        col1_text_count = sum(1 for r in tbl[1:]
+                                               if r[1] and not _is_numeric(r[1]))
+                        label_col = 1 if col1_text_count > col0_text_count else 0
+                    else:
+                        label_col = 0
+                # Carry-forward labels for empty cells
+                last_label = ""
+                for r in tbl[1:]:
+                    if label_col < len(r):
+                        cell = (r[label_col] or "").strip()
+                        if cell:
+                            last_label = cell
+                        elif last_label:
+                            r[label_col] = last_label
             if len(tbl) >= 2:
                 tables.append(tbl)
             i = j
@@ -293,55 +336,41 @@ def raw_extract_statements(
             continue
 
         pdf_id = _short_pdf_id(cls.name)
+
+        # ── REGROUP: one sheet per statement type. Each sheet stacks
+        # Standalone block (top) + Consolidated block (bottom).
+        by_stmt: dict[str, dict[str, list[int]]] = {}   # stmt → {sc_label → page_idxs}
         for (sc_label, stmt), page_idxs in grouped.items():
-            # Collect all tables on these pages
-            tables_collected: list[list[list[str]]] = []
-            for pn in sorted(page_idxs):
-                tables = _extract_md_tables_from_page(md_pages.get(pn, ""))
-                for tbl in tables:
-                    # Only keep tables with ≥3 rows that contain numbers
-                    n_numeric = sum(1 for r in tbl for c in r
-                                    if _try_parse_num(c) is not None)
-                    if len(tbl) >= 3 and n_numeric >= 5:
-                        tables_collected.append(tbl)
+            by_stmt.setdefault(stmt, {})[sc_label] = page_idxs
 
-            if not tables_collected:
-                continue
+        # Render order within each sheet: Standalone first, Consolidated second
+        # ("" scope last, only used when dual_section is False)
+        scope_order = ["Standalone", "Consolidated", ""]
 
-            # Make sheet name (omit scope if empty, e.g. single-section reports)
-            if sc_label:
-                sheet_name_raw = f"{pdf_id} - {sc_label} {stmt}"
-            else:
-                sheet_name_raw = f"{pdf_id} - {stmt}"
-            sheet_name_raw = re.sub(r"\s+", " ", sheet_name_raw).strip()
-            sheet_name = _safe_sheet_name(sheet_name_raw, existing_sheets)
-            existing_sheets.add(sheet_name)
-            ws = wb.create_sheet(sheet_name)
-
-            # Title row
-            title_row_idx = 1
-            ws.cell(title_row_idx, 1, value=f"{cls.name}").font = CALIBRI11_BOLD
-            ws.cell(title_row_idx, 1).fill = HEADER_FILL
-            ws.cell(title_row_idx + 1, 1,
-                    value=f"{sc_label} {stmt}").font = CALIBRI11_BOLD
-            ws.cell(title_row_idx + 1, 1).fill = HEADER_FILL
-            row_cursor = title_row_idx + 3   # leave a blank row
-
-            for ti, tbl in enumerate(tables_collected):
-                # Optional separator between multiple tables
+        def _write_block(ws, row_cursor: int, sc_label: str,
+                          tables: list, stmt_name: str) -> int:
+            """Write a [sc_label + stmt_name] block at row_cursor. Returns next row."""
+            if not tables:
+                return row_cursor
+            # Block header
+            block_title = f"{sc_label} {stmt_name}".strip()
+            ws.cell(row_cursor, 1, value=block_title).font = CALIBRI11_BOLD
+            ws.cell(row_cursor, 1).fill = HEADER_FILL
+            row_cursor += 1
+            for ti, tbl in enumerate(tables):
                 if ti > 0:
-                    row_cursor += 1
-                # Header row
+                    row_cursor += 1   # gap between sub-tables
                 header = tbl[0]
                 for ci, h in enumerate(header, start=1):
                     cell = ws.cell(row_cursor, ci, value=h)
                     cell.font = CALIBRI11_BOLD
                     cell.fill = HEADER_FILL
                     cell.border = THIN_BORDER
-                    cell.alignment = Alignment(horizontal="center" if ci > 1 else "left",
-                                                wrap_text=True, vertical="center")
+                    cell.alignment = Alignment(
+                        horizontal="center" if ci > 1 else "left",
+                        wrap_text=True, vertical="center",
+                    )
                 row_cursor += 1
-                # Body rows
                 for row in tbl[1:]:
                     for ci, cell_text in enumerate(row, start=1):
                         v_num = _try_parse_num(cell_text)
@@ -353,24 +382,64 @@ def raw_extract_statements(
                         cell.font = CALIBRI11
                         cell.border = THIN_BORDER
                         if ci == 1:
-                            cell.alignment = Alignment(horizontal="left", vertical="center")
+                            cell.alignment = Alignment(horizontal="left",
+                                                       vertical="center")
                         else:
-                            cell.alignment = Alignment(horizontal="right", vertical="center")
+                            cell.alignment = Alignment(horizontal="right",
+                                                       vertical="center")
                     row_cursor += 1
+            return row_cursor + 2   # blank gap between blocks
 
-            # Auto-size columns roughly
+        for stmt, scopes_pages in by_stmt.items():
+            # Make a single sheet for this statement type
+            sheet_name_raw = f"{pdf_id} - {stmt}".strip()
+            sheet_name = _safe_sheet_name(sheet_name_raw, existing_sheets)
+            existing_sheets.add(sheet_name)
+            ws = wb.create_sheet(sheet_name)
+
+            # Top-level title (PDF filename)
+            ws.cell(1, 1, value=cls.name).font = CALIBRI11_BOLD
+            ws.cell(1, 1).fill = HEADER_FILL
+            row_cursor = 3   # leave a blank row
+
+            wrote_any = False
+            for sc_label in scope_order:
+                if sc_label not in scopes_pages:
+                    continue
+                page_idxs = scopes_pages[sc_label]
+                tables_collected: list[list[list[str]]] = []
+                for pn in sorted(page_idxs):
+                    tables = _extract_md_tables_from_page(md_pages.get(pn, ""))
+                    for tbl in tables:
+                        n_numeric = sum(1 for r in tbl for c in r
+                                        if _try_parse_num(c) is not None)
+                        if len(tbl) >= 3 and n_numeric >= 5:
+                            tables_collected.append(tbl)
+                if not tables_collected:
+                    continue
+                row_cursor = _write_block(ws, row_cursor, sc_label,
+                                           tables_collected, stmt)
+                wrote_any = True
+
+            if not wrote_any:
+                # No real tables on any scope's pages; remove the empty sheet
+                wb.remove(ws)
+                continue
+
+            # Auto-size columns
             for ci in range(1, ws.max_column + 1):
                 max_len = 0
                 for r in range(1, ws.max_row + 1):
                     v = ws.cell(r, ci).value
                     if v is not None:
                         max_len = max(max_len, len(str(v)))
-                ws.column_dimensions[get_column_letter(ci)].width = min(max(12, max_len + 2), 50)
+                ws.column_dimensions[get_column_letter(ci)].width = min(
+                    max(14, max_len + 2), 50
+                )
 
             res.sheets_written.append(sheet_name)
             logger.info(f"raw_extract: wrote {sheet_name} "
-                        f"({len(tables_collected)} tables, "
-                        f"{len(page_idxs)} source pages)")
+                        f"(scopes: {list(scopes_pages.keys())})")
 
     if not res.sheets_written:
         # Make sure workbook has at least one sheet

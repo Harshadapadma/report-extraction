@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 # Cache version stamp — bump this whenever the extraction logic changes so
 # old .md sidecars get regenerated on the next run. Without this, the user
 # would have to manually delete every cached .md after a fix.
-EXTRACTION_VERSION = "v18-pymupdf4llm-primary"
+EXTRACTION_VERSION = "v19-pdfplumber-primary-pymupdf-optional"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -173,48 +173,44 @@ def _pdf_to_markdown(pdf_path: str, force_ocr: bool = False) -> str:
             except Exception:
                 pass
 
-    # ── PRIMARY: pymupdf4llm (best layout-aware extraction) ───────────────
-    # Multi-column layouts, tables, and prose flow are handled much better
-    # than pdfplumber alone. Falls back to pdfplumber on failure.
-    if not force_ocr:
+    # ── pymupdf4llm: opt-in only via env var ─────────────────────────────
+    # The pymupdf4llm output structure broke the table-row label parser
+    # (labels ended up None, values shifted columns). Default OFF until
+    # the table-row format is normalized. Set USE_PYMUPDF4LLM=1 to test.
+    import os as _os
+    if _os.environ.get("USE_PYMUPDF4LLM") == "1" and not force_ocr:
         try:
             import pymupdf4llm
-            # page_chunks=True returns list[{metadata, text}] one per page
             page_chunks = pymupdf4llm.to_markdown(
                 pdf_path, page_chunks=True, write_images=False,
                 show_progress=False,
             )
-            if page_chunks and len(page_chunks) > 0:
-                full_parts: list[str] = []
+            if page_chunks:
+                full_parts = []
                 for chunk in page_chunks:
                     pn_meta = chunk.get("metadata", {}).get("page", 0)
                     txt = chunk.get("text", "")
                     if txt.strip():
-                        full_parts.append(f"\n## Page {pn_meta + 1}\n"
-                                          f"<!-- FILE: {Path(pdf_path).name} | "
-                                          f"PAGE: {pn_meta + 1}/{len(page_chunks)} -->\n"
-                                          f"{txt}\n")
+                        full_parts.append(
+                            f"\n## Page {pn_meta + 1}\n"
+                            f"<!-- FILE: {Path(pdf_path).name} | "
+                            f"PAGE: {pn_meta + 1}/{len(page_chunks)} -->\n"
+                            f"{txt}\n"
+                        )
                 if full_parts:
-                    full = f"<!-- extractor:{EXTRACTION_VERSION} -->\n" + "\n".join(full_parts)
+                    full = (f"<!-- extractor:{EXTRACTION_VERSION} -->\n"
+                            + "\n".join(full_parts))
                     for cache in cache_paths:
                         try:
                             cache.write_text(full, encoding="utf-8")
-                            logger.info(f"_pdf_to_markdown: cached {cache.name} "
-                                        f"via pymupdf4llm "
-                                        f"({len(full)//1000}k chars, "
-                                        f"{len(page_chunks)} pages)")
                             break
                         except Exception:
                             continue
                     return full
-        except ImportError:
-            logger.debug("_pdf_to_markdown: pymupdf4llm not installed, "
-                         "falling back to pdfplumber")
         except Exception as exc:
-            logger.warning(f"_pdf_to_markdown: pymupdf4llm failed ({exc}), "
-                           f"falling back to pdfplumber")
+            logger.warning(f"pymupdf4llm failed ({exc}); using pdfplumber")
 
-    # ── FALLBACK: pdfplumber + multi-col reconstructor + OCR ──────────────
+    # ── PRIMARY: pdfplumber + multi-col reconstructor + OCR ──────────────
     import pdfplumber
     parts: list[str] = []
     ocr_pages: list[int] = []
