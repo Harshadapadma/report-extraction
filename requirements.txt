@@ -11,3 +11,6 @@ requests>=2.31.0
 beautifulsoup4>=4.12.0
 yfinance>=0.2.38
 pdfplumber>=0.10.0
+pymupdf4llm>=0.0.17
+pytesseract>=0.3.10
+lxml>=4.9.0

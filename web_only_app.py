@@ -36,55 +36,35 @@ sys.path.insert(0, str(Path(__file__).parent))
 import logging
 logger = logging.getLogger(__name__)
 
-# ── Auto-install dependencies ──────────────────────────────────────────────────
-def _pip(*pkgs):
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", *pkgs])
-
-try:
-    import streamlit as st
-except ImportError:
-    _pip("streamlit>=1.35.0"); import streamlit as st
-
-try:
-    import openpyxl
-except ImportError:
-    _pip("openpyxl>=3.1.2"); import openpyxl
-
-try:
-    import pandas as pd
-except ImportError:
-    _pip("pandas>=2.2.0"); import pandas as pd
-
-try:
-    import requests as _requests_mod
-except ImportError:
-    _pip("requests>=2.31.0"); import requests as _requests_mod
-
-try:
-    from bs4 import BeautifulSoup as _BS4
-except ImportError:
-    _pip("beautifulsoup4>=4.12.0"); from bs4 import BeautifulSoup as _BS4
-
+# ── Imports (deps come from requirements.txt — no runtime pip) ───────────────
+import streamlit as st
+import openpyxl
+import pandas as pd
+import requests as _requests_mod
+from bs4 import BeautifulSoup as _BS4
 try:
     import yfinance as yf
 except ImportError:
-    _pip("yfinance>=0.2.38"); import yfinance as yf
+    yf = None   # optional; disabled if missing
+from openai import OpenAI
 
-try:
-    from openai import OpenAI
-except ImportError:
-    _pip("openai>=1.30.0"); from openai import OpenAI
+# Defer playwright import — it's heavy (~2-3 seconds) and only needed when
+# scraping JS-rendered company sites. Lazy-loaded on first call.
+_PLAYWRIGHT_AVAILABLE = None   # tri-state: None=unchecked, True=ok, False=missing
+_sync_playwright = None
 
-try:
-    from playwright.sync_api import sync_playwright as _sync_playwright
-    _PLAYWRIGHT_AVAILABLE = True
-except ImportError:
-    _pip("playwright>=1.44.0")
+def _get_playwright():
+    """Lazy-import playwright. Returns sync_playwright fn or None."""
+    global _PLAYWRIGHT_AVAILABLE, _sync_playwright
+    if _PLAYWRIGHT_AVAILABLE is not None:
+        return _sync_playwright
     try:
-        from playwright.sync_api import sync_playwright as _sync_playwright
+        from playwright.sync_api import sync_playwright as _sp
+        _sync_playwright = _sp
         _PLAYWRIGHT_AVAILABLE = True
     except ImportError:
         _PLAYWRIGHT_AVAILABLE = False
+    return _sync_playwright
 
 
 # ── Page config ────────────────────────────────────────────────────────────────
@@ -4468,11 +4448,62 @@ with st.sidebar:
         ),
     )
     if use_llm:
-        api_key   = st.text_input("DeepSeek API Key", type="password")
-        api_model = st.selectbox("LLM Model", ["deepseek-chat", "deepseek-reasoner"])
+        _provider = st.selectbox(
+            "LLM Provider",
+            [
+                "AI Pipe + Gemini Flash (free, recommended for IN)",
+                "AI Pipe + Llama 3.3 70B (free)",
+                "Gemini 1.5 Flash (free, direct)",
+                "Gemini 2.0 Flash (free, direct)",
+                "Gemini 2.5 Flash (free, direct)",
+                "Gemini 1.5 Flash 8B (free, fastest)",
+                "DeepSeek (paid, ~₹8/run)",
+                "DeepSeek Reasoner (paid, slower)",
+            ],
+            help="AI Pipe = free proxy via aipipe.org. Direct Gemini may hit limit:0 in some regions.",
+        )
+        if _provider.startswith("AI Pipe + Gemini"):
+            api_key      = st.text_input("AI Pipe Token", type="password",
+                                          help="Get free at aipipe.org/login")
+            api_model    = "google/gemini-2.0-flash-exp:free"
+            api_base_url = "https://aipipe.org/openrouter/v1"
+        elif _provider.startswith("AI Pipe + Llama"):
+            api_key      = st.text_input("AI Pipe Token", type="password",
+                                          help="Get free at aipipe.org/login")
+            api_model    = "meta-llama/llama-3.3-70b-instruct:free"
+            api_base_url = "https://aipipe.org/openrouter/v1"
+        elif _provider.startswith("Gemini 1.5 Flash 8B"):
+            api_key      = st.text_input("Google AI Studio API Key", type="password",
+                                          help="Get free at aistudio.google.com")
+            api_model    = "gemini-1.5-flash-8b"
+            api_base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
+        elif _provider.startswith("Gemini 1.5"):
+            api_key      = st.text_input("Google AI Studio API Key", type="password",
+                                          help="Get free at aistudio.google.com")
+            api_model    = "gemini-1.5-flash"
+            api_base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
+        elif _provider.startswith("Gemini 2.0"):
+            api_key      = st.text_input("Google AI Studio API Key", type="password",
+                                          help="Get free at aistudio.google.com")
+            api_model    = "gemini-2.0-flash"
+            api_base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
+        elif _provider.startswith("Gemini 2.5"):
+            api_key      = st.text_input("Google AI Studio API Key", type="password",
+                                          help="Get free at aistudio.google.com")
+            api_model    = "gemini-2.5-flash"
+            api_base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
+        elif _provider.startswith("DeepSeek Reasoner"):
+            api_key      = st.text_input("DeepSeek API Key", type="password")
+            api_model    = "deepseek-reasoner"
+            api_base_url = "https://api.deepseek.com"
+        else:
+            api_key      = st.text_input("DeepSeek API Key", type="password")
+            api_model    = "deepseek-chat"
+            api_base_url = "https://api.deepseek.com"
     else:
-        api_key   = ""
-        api_model = "deepseek-chat"
+        api_key      = ""
+        api_model    = "deepseek-chat"
+        api_base_url = "https://api.deepseek.com"
 
     st.markdown("---")
     st.header("📥 Pipeline Inputs")
@@ -4673,6 +4704,507 @@ with st.sidebar:
     st.markdown("---")
     st.header("🚀 Step 2 — Run Full Pipeline")
     run_btn = st.button("🚀 Run Full Pipeline", type="primary", use_container_width=True)
+
+    # ── LLM-Fill Pipeline (recommended) ────────────────────────────────────────
+    # The simpler path: pattern-match obvious cells for free, send the rest to
+    # an LLM (Gemini / AI Pipe / DeepSeek). Best precision/recall trade-off.
+    st.markdown("---")
+    with st.expander("⚡ LLM-only Fill (single LLM call) — recommended", expanded=True):
+        st.caption(
+            "Fastest, most accurate path. Sends PDFs + template to the chosen "
+            "LLM following the manual extraction algorithm. Either upload "
+            "PDFs manually OR auto-fetch from NSE/BSE/company-site."
+        )
+        llm_mode = st.radio(
+            "PDF source",
+            ["📡 Auto-fetch from NSE / BSE / company site (recommended)",
+             "📤 I'll upload them manually"],
+            key="llm_mode", horizontal=False,
+        )
+        llm_auto = llm_mode.startswith("📡")
+        if llm_auto:
+            st.caption("Will discover and download AR + Quarterly Results + IPs "
+                       "automatically. Saves to output/downloaded_pdfs/<SYMBOL>/")
+            llm_pdfs = None
+        else:
+            llm_pdfs = st.file_uploader(
+                "Upload PDFs (Annual Report, Quarterly Results, IP)",
+                type=["pdf"], accept_multiple_files=True, key="llm_pdfs",
+            )
+        _ready = bool(template_file) and bool(api_key) and (
+            (llm_auto and bool(nse_symbol)) or
+            (not llm_auto and bool(llm_pdfs))
+        )
+        if not template_file: st.caption("⚠️ Upload template")
+        if not api_key:        st.caption("⚠️ API key needed (sidebar)")
+        if llm_auto and not nse_symbol:
+            st.caption("⚠️ Enter NSE Symbol in sidebar for auto-fetch")
+
+        # ── Four buttons ─────────────────────────────────────────────────
+        llm_run_btn = st.button(
+            "🚀 Pattern + LLM Combined (recommended) — best fill, lower cost",
+            type="primary", use_container_width=True, key="llm_run_btn",
+            disabled=not _ready,
+            help="Free pattern match first → LLM only on remaining cells.",
+        )
+        llm_only_btn = st.button(
+            "⚡ LLM Only (no pattern pre-pass)",
+            use_container_width=True, key="llm_only_btn",
+            disabled=not _ready,
+            help="Sends ALL cells to LLM. Useful for comparison/debug.",
+        )
+        st.caption("─── OR ───")
+        _extract_ready = bool(
+            (llm_auto and nse_symbol) or (not llm_auto and llm_pdfs)
+        )
+        pattern_only_btn = st.button(
+            "🔧 Pattern Match Only (no LLM, no cost)",
+            use_container_width=True, key="pattern_only_btn",
+            disabled=not _extract_ready or not template_file,
+            help="Markdown table label-match. ~40-50% recall, no API key.",
+        )
+        rag_pattern_btn = st.button(
+            "🔬 RAG Fill — pattern mode (no LLM, no cost)",
+            use_container_width=True, key="rag_pattern_btn",
+            disabled=not _extract_ready or not template_file,
+            help="NEW: vector retrieval + label match. Per-cell precision.",
+        )
+        rag_llm_btn = st.button(
+            "🧪 RAG Fill — LLM mode (~$0.30/run on DeepSeek)",
+            use_container_width=True, key="rag_llm_btn",
+            disabled=not _extract_ready or not template_file or not api_key,
+            help="NEW: retrieval + tiny LLM call per cell. Handles derived values.",
+        )
+        page_batch_btn = st.button(
+            "🎯 Page-Batch Fill (~$0.05/run, ~12 LLM calls)",
+            use_container_width=True, key="page_batch_btn",
+            disabled=not _extract_ready or not template_file or not api_key,
+            help="Pattern + ONE LLM call per (source page → template section). "
+                 "Cheapest LLM mode. Focused per-table extraction.",
+        )
+        raw_extract_btn = st.button(
+            "📊 Raw Extract — full P&L/BS/CF tables verbatim (no LLM, no cost)",
+            use_container_width=True, key="raw_extract_btn",
+            disabled=not _extract_ready,
+            help="Dumps the actual financial statement tables from each PDF "
+                 "into formatted sheets (Calibri 11, accounting 2-decimal). "
+                 "No template mapping — raw extraction.",
+        )
+        extract_only_btn = st.button(
+            "📄 Extract Only (no LLM, no cost) — generate .md files",
+            use_container_width=True, key="extract_only_btn",
+            disabled=not _extract_ready,
+            help="PDF→Markdown conversion + OCR. ZIP of .md files.",
+        )
+
+    # ── LLM-fill handler — Pattern+LLM Combined OR LLM-only ────────────
+    _llm_combined_clicked = st.session_state.get('llm_run_btn', False)
+    _llm_only_clicked     = st.session_state.get('llm_only_btn', False)
+    if _llm_combined_clicked or _llm_only_clicked:
+        _skip_pattern = _llm_only_clicked
+        _mode_label = "LLM Only (no pattern)" if _skip_pattern else "Pattern + LLM Combined"
+        if not (template_file and api_key):
+            st.error(f"Need template + API key to run {_mode_label}.")
+        elif llm_auto and not nse_symbol:
+            st.error("Auto-fetch needs an NSE symbol in sidebar.")
+        elif (not llm_auto) and not llm_pdfs:
+            st.error("Upload at least one PDF or switch to auto-fetch mode.")
+        else:
+            import tempfile as _tf, traceback as _tb
+            from pathlib import Path as _Path
+            try:
+                from pipeline.llm_fill import llm_fill_template
+                template_file.seek(0)
+                with _tf.NamedTemporaryFile(suffix=".xlsx", delete=False) as _tt:
+                    _tt.write(template_file.read())
+                    _tmpl_path = _tt.name
+                _pdf_paths = []
+                if not llm_auto and llm_pdfs:
+                    for upf in llm_pdfs:
+                        upf.seek(0)
+                        with _tf.NamedTemporaryFile(suffix=".pdf", delete=False) as _tp:
+                            _tp.write(upf.read())
+                            _pdf_paths.append(_tp.name)
+                _suffix = "_llm_only_filled.xlsx" if _skip_pattern else "_llm_filled.xlsx"
+                _out = str(_Path(_tmpl_path).with_name(
+                    f"{nse_symbol or 'output'}{_suffix}"
+                ))
+                spinner_msg = (f"Auto-fetching PDFs for {nse_symbol}… [{_mode_label}]"
+                               if llm_auto else
+                               f"Running {_mode_label} on {len(_pdf_paths)} PDFs…")
+                with st.spinner(spinner_msg):
+                    llm_res = llm_fill_template(
+                        template_path=_tmpl_path,
+                        pdf_paths=_pdf_paths or None,
+                        output_path=_out,
+                        api_key=api_key,
+                        model=api_model or "deepseek-chat",
+                        base_url=api_base_url or "https://api.deepseek.com",
+                        auto_fetch=llm_auto,
+                        nse_symbol=nse_symbol or None,
+                        bse_code=bse_code or None,
+                        skip_pattern_match=_skip_pattern,
+                    )
+                st.success(f"✅ {llm_res.summary()}")
+                colA, colB, colC, colD = st.columns(4)
+                colA.metric("Cells written", llm_res.cells_written)
+                colB.metric("HIGH",   llm_res.by_confidence.get("HIGH", 0))
+                colC.metric("MEDIUM", llm_res.by_confidence.get("MEDIUM", 0))
+                colD.metric("LOW",    llm_res.by_confidence.get("LOW", 0))
+                if llm_res.warnings:
+                    for w in llm_res.warnings:
+                        st.warning(w)
+                try:
+                    with open(_out, "rb") as _fh:
+                        _b = _fh.read()
+                    _dl_name = (
+                        f"{nse_symbol or 'company'}"
+                        f"{'_llm_only_filled' if _skip_pattern else '_llm_filled'}.xlsx"
+                    )
+                    st.download_button(
+                        f"⬇️ Download {_mode_label} Excel",
+                        data=_b, file_name=_dl_name,
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        type="primary", use_container_width=True,
+                    )
+                except Exception as _de:
+                    st.warning(f"Could not load output file: {_de}")
+            except Exception as _err:
+                st.error(f"LLM Fill failed: {_err}")
+                with st.expander("Error details"):
+                    st.code(_tb.format_exc())
+
+    # ── Pattern-Only handler ─────────────────────────────────────────
+    if st.session_state.get('pattern_only_btn', False):
+        import tempfile as _tf, traceback as _tb
+        from pathlib import Path as _Path
+        try:
+            from pipeline.llm_fill import (
+                _classify_pdf, _auto_fetch_pdfs, _pattern_fill,
+                _read_template_specs, _write_filled_excel,
+            )
+            template_file.seek(0)
+            with _tf.NamedTemporaryFile(suffix=".xlsx", delete=False) as _tt:
+                _tt.write(template_file.read())
+                _tmpl_path_pat = _tt.name
+            _out_pat = str(_Path(_tmpl_path_pat).with_name(
+                f"{nse_symbol or 'output'}_pattern_filled.xlsx"
+            ))
+            _pdf_paths_pat = []
+            if llm_auto and nse_symbol:
+                save_root = (_Path(__file__).parent / "output"
+                             / "downloaded_pdfs" / nse_symbol.upper())
+                with st.spinner(f"Auto-fetching PDFs for {nse_symbol}…"):
+                    _pdf_paths_pat = _auto_fetch_pdfs(
+                        nse_symbol, [], str(save_root),
+                        bse_code=bse_code or None,
+                    )
+            else:
+                for upf in llm_pdfs or []:
+                    upf.seek(0)
+                    with _tf.NamedTemporaryFile(suffix=".pdf", delete=False) as _tp:
+                        _tp.write(upf.read())
+                        _pdf_paths_pat.append(_tp.name)
+            with st.spinner(f"Extracting tables from {len(_pdf_paths_pat)} PDFs…"):
+                pdf_data_pat = []
+                for pp in _pdf_paths_pat:
+                    try:
+                        cls, text = _classify_pdf(pp)
+                        pdf_data_pat.append((cls, text))
+                    except Exception as exc:
+                        st.warning(f"Classify failed: {pp}: {exc}")
+            specs = _read_template_specs(_tmpl_path_pat)
+            with st.spinner("Pattern matching…"):
+                pattern_fills = _pattern_fill(specs, pdf_data_pat)
+            stats = _write_filled_excel(_tmpl_path_pat, _out_pat, pattern_fills)
+            st.success(
+                f"✅ Pattern matcher: {stats['written']} cells written "
+                f"(no LLM, no cost) from {len(pdf_data_pat)} PDFs"
+            )
+            try:
+                with open(_out_pat, "rb") as _fh:
+                    _b = _fh.read()
+                st.download_button(
+                    "⬇️ Download Pattern-Filled Excel", data=_b,
+                    file_name=f"{nse_symbol or 'company'}_pattern_filled.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    type="primary", use_container_width=True,
+                )
+            except Exception as _de:
+                st.warning(f"Could not load output file: {_de}")
+        except Exception as _err:
+            st.error(f"Pattern-match failed: {_err}")
+            with st.expander("Error details"):
+                st.code(_tb.format_exc())
+
+    # ── RAG Fill handler (pattern OR llm mode) ───────────────────────
+    _rag_pattern_clicked = st.session_state.get('rag_pattern_btn', False)
+    _rag_llm_clicked     = st.session_state.get('rag_llm_btn', False)
+    if _rag_pattern_clicked or _rag_llm_clicked:
+        _rag_mode = "llm" if _rag_llm_clicked else "pattern"
+        import tempfile as _tf, traceback as _tb
+        from pathlib import Path as _Path
+        try:
+            from pipeline.rag_fill import rag_fill_template
+            template_file.seek(0)
+            with _tf.NamedTemporaryFile(suffix=".xlsx", delete=False) as _tt:
+                _tt.write(template_file.read())
+                _tmpl_path_rag = _tt.name
+            _out_rag = str(_Path(_tmpl_path_rag).with_name(
+                f"{nse_symbol or 'output'}_rag_{_rag_mode}_filled.xlsx"
+            ))
+            # Collect PDFs (manual or auto-fetched)
+            _pdf_paths_rag = []
+            if llm_auto and nse_symbol:
+                from pipeline.llm_fill import _auto_fetch_pdfs
+                save_root = (_Path(__file__).parent / "output"
+                             / "downloaded_pdfs" / nse_symbol.upper())
+                with st.spinner(f"Auto-fetching PDFs for {nse_symbol}…"):
+                    _pdf_paths_rag = _auto_fetch_pdfs(
+                        nse_symbol, [], str(save_root),
+                        bse_code=bse_code or None,
+                    )
+            else:
+                for upf in llm_pdfs or []:
+                    upf.seek(0)
+                    with _tf.NamedTemporaryFile(
+                        suffix=".pdf", prefix=f"upload_{upf.name}_",
+                        delete=False,
+                    ) as _tp:
+                        _tp.write(upf.read())
+                        _pdf_paths_rag.append(_tp.name)
+            if not _pdf_paths_rag:
+                st.error("No PDFs to process.")
+                st.stop()
+
+            _spin_msg = (f"RAG ({_rag_mode}) on {len(_pdf_paths_rag)} PDFs — "
+                         f"indexing + per-cell retrieval…")
+            with st.spinner(_spin_msg):
+                rag_res = rag_fill_template(
+                    template_path=_tmpl_path_rag,
+                    pdf_paths=_pdf_paths_rag,
+                    output_path=_out_rag,
+                    api_key=api_key,
+                    model=(api_model or "deepseek-chat"),
+                    base_url=(api_base_url or "https://api.deepseek.com"),
+                    mode=_rag_mode,
+                )
+
+            st.success(
+                f"✅ RAG ({_rag_mode}): {rag_res.cells_written} cells written · "
+                f"{rag_res.chunks_indexed} chunks indexed · "
+                f"{rag_res.elapsed_sec:.1f}s"
+            )
+            if rag_res.by_confidence:
+                _conf_parts = [f"{k}={v}" for k, v in rag_res.by_confidence.items()]
+                st.caption("Confidence: " + ", ".join(_conf_parts))
+            for w in rag_res.warnings:
+                st.info(w)
+            try:
+                with open(_out_rag, "rb") as _fh:
+                    _b = _fh.read()
+                st.download_button(
+                    f"⬇️ Download RAG-{_rag_mode} Filled Excel", data=_b,
+                    file_name=f"{nse_symbol or 'company'}_rag_{_rag_mode}_filled.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    type="primary", use_container_width=True,
+                )
+            except Exception as _de:
+                st.warning(f"Could not load output: {_de}")
+        except Exception as _err:
+            st.error(f"RAG fill failed: {_err}")
+            with st.expander("Error details"):
+                st.code(_tb.format_exc())
+
+    # ── Raw-Extract handler ──────────────────────────────────────────
+    if st.session_state.get('raw_extract_btn', False):
+        import tempfile as _tf, traceback as _tb
+        from pathlib import Path as _Path
+        try:
+            from pipeline.raw_extract import raw_extract_statements
+            _pdfs = []
+            if llm_auto and nse_symbol:
+                from pipeline.llm_fill import _auto_fetch_pdfs
+                save_root = (_Path(__file__).parent / "output"
+                             / "downloaded_pdfs" / nse_symbol.upper())
+                with st.spinner(f"Auto-fetching PDFs for {nse_symbol}…"):
+                    _pdfs = _auto_fetch_pdfs(nse_symbol, [], str(save_root),
+                                              bse_code=bse_code or None)
+            else:
+                for upf in llm_pdfs or []:
+                    upf.seek(0)
+                    with _tf.NamedTemporaryFile(
+                        suffix=".pdf", prefix=f"upload_{upf.name}_",
+                        delete=False,
+                    ) as _tp:
+                        _tp.write(upf.read())
+                        _pdfs.append(_tp.name)
+            if not _pdfs:
+                st.error("No PDFs to process.")
+                st.stop()
+            _out = str(_Path(_tf.gettempdir()) /
+                       f"{nse_symbol or 'output'}_raw_statements.xlsx")
+            with st.spinner(f"Extracting full statements from {len(_pdfs)} PDFs…"):
+                re_res = raw_extract_statements(_pdfs, _out)
+            st.success(
+                f"✅ Raw extract: {len(re_res.sheets_written)} sheets written · "
+                f"{re_res.elapsed_sec:.1f}s"
+            )
+            if re_res.sheets_written:
+                with st.expander(f"Sheet list ({len(re_res.sheets_written)})"):
+                    for s in re_res.sheets_written:
+                        st.write(f"• {s}")
+            for w in re_res.warnings:
+                st.info(w)
+            try:
+                with open(_out, "rb") as _fh:
+                    _b = _fh.read()
+                st.download_button(
+                    "⬇️ Download Raw Statements Excel", data=_b,
+                    file_name=f"{nse_symbol or 'company'}_raw_statements.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    type="primary", use_container_width=True,
+                )
+            except Exception as _de:
+                st.warning(f"Could not load output: {_de}")
+        except Exception as _err:
+            st.error(f"Raw extract failed: {_err}")
+            with st.expander("Error details"):
+                st.code(_tb.format_exc())
+
+    # ── Page-Batch Fill handler ─────────────────────────────────────
+    if st.session_state.get('page_batch_btn', False):
+        import tempfile as _tf, traceback as _tb
+        from pathlib import Path as _Path
+        try:
+            from pipeline.page_batch_fill import page_batch_fill_template
+            template_file.seek(0)
+            with _tf.NamedTemporaryFile(suffix=".xlsx", delete=False) as _tt:
+                _tt.write(template_file.read())
+                _tmpl = _tt.name
+            _out = str(_Path(_tmpl).with_name(
+                f"{nse_symbol or 'output'}_page_batch_filled.xlsx"
+            ))
+            _pdfs = []
+            if llm_auto and nse_symbol:
+                from pipeline.llm_fill import _auto_fetch_pdfs
+                save_root = (_Path(__file__).parent / "output"
+                             / "downloaded_pdfs" / nse_symbol.upper())
+                with st.spinner(f"Auto-fetching PDFs for {nse_symbol}…"):
+                    _pdfs = _auto_fetch_pdfs(nse_symbol, [], str(save_root),
+                                              bse_code=bse_code or None)
+            else:
+                for upf in llm_pdfs or []:
+                    upf.seek(0)
+                    with _tf.NamedTemporaryFile(
+                        suffix=".pdf", prefix=f"upload_{upf.name}_",
+                        delete=False,
+                    ) as _tp:
+                        _tp.write(upf.read())
+                        _pdfs.append(_tp.name)
+            if not _pdfs:
+                st.error("No PDFs.")
+                st.stop()
+            with st.spinner(f"Page-batch fill on {len(_pdfs)} PDFs…"):
+                pb_res = page_batch_fill_template(
+                    template_path=_tmpl,
+                    pdf_paths=_pdfs,
+                    output_path=_out,
+                    api_key=api_key,
+                    model=(api_model or "deepseek-chat"),
+                    base_url=(api_base_url or "https://api.deepseek.com"),
+                )
+            st.success(
+                f"✅ Page-batch: {pb_res.cells_written} cells written · "
+                f"{pb_res.n_llm_calls} LLM calls · "
+                f"~${pb_res.est_cost_usd:.3f} · "
+                f"{pb_res.elapsed_sec:.1f}s"
+            )
+            for w in pb_res.warnings:
+                st.info(w)
+            try:
+                with open(_out, "rb") as _fh:
+                    _b = _fh.read()
+                st.download_button(
+                    "⬇️ Download Page-Batch Filled Excel", data=_b,
+                    file_name=f"{nse_symbol or 'company'}_page_batch_filled.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    type="primary", use_container_width=True,
+                )
+            except Exception as _de:
+                st.warning(f"Could not load output: {_de}")
+        except Exception as _err:
+            st.error(f"Page-batch failed: {_err}")
+            with st.expander("Error details"):
+                st.code(_tb.format_exc())
+
+    # ── Extract-Only handler ─────────────────────────────────────────
+    if st.session_state.get('extract_only_btn', False):
+        import tempfile as _tf, traceback as _tb, zipfile as _zf, io as _io
+        from pathlib import Path as _Path
+        try:
+            from pipeline.llm_fill import (
+                _pdf_to_markdown, _classify_pdf, _auto_fetch_pdfs,
+            )
+            _pdf_paths_ext = []
+            if llm_auto and nse_symbol:
+                save_root = (_Path(__file__).parent / "output"
+                             / "downloaded_pdfs" / nse_symbol.upper())
+                with st.spinner(f"Auto-fetching PDFs for {nse_symbol}…"):
+                    _pdf_paths_ext = _auto_fetch_pdfs(
+                        nse_symbol, [], str(save_root),
+                        bse_code=bse_code or None,
+                    )
+            else:
+                for upf in llm_pdfs or []:
+                    upf.seek(0)
+                    with _tf.NamedTemporaryFile(
+                        suffix=".pdf", prefix=f"upload_{upf.name}_",
+                        delete=False,
+                    ) as _tp:
+                        _tp.write(upf.read())
+                        _pdf_paths_ext.append(_tp.name)
+            if not _pdf_paths_ext:
+                st.error("No PDFs to extract.")
+                st.stop()
+            st.info(f"Extracting markdown from {len(_pdf_paths_ext)} PDF(s)…")
+            progress = st.progress(0)
+            _md_results = []
+            for i, pp in enumerate(_pdf_paths_ext):
+                pp_name = _Path(pp).name
+                progress.progress(int((i+1)/len(_pdf_paths_ext)*100),
+                                  text=f"Extracting {pp_name}…")
+                try:
+                    cls, _ = _classify_pdf(pp)
+                    md = _pdf_to_markdown(pp)
+                    info = (
+                        f"# {pp_name}\n\n"
+                        f"- Classification: `{cls.period_type}` / `{cls.stmt_type}`\n"
+                        f"- Pages: {cls.pages_total}\n"
+                        f"- Markdown chars: {len(md):,}\n\n---\n\n"
+                    )
+                    _md_results.append((pp_name, cls.period_type, info + md))
+                except Exception as exc:
+                    _md_results.append((pp_name, "ERROR", f"# {pp_name}\n\nERROR: {exc}"))
+            progress.empty()
+            st.success(f"✅ Extracted {len(_md_results)} PDFs")
+            _zip_buf = _io.BytesIO()
+            with _zf.ZipFile(_zip_buf, "w", _zf.ZIP_DEFLATED) as zf:
+                for name, _, md in _md_results:
+                    md_name = name.rsplit(".", 1)[0] + ".md"
+                    zf.writestr(md_name, md)
+            _zip_buf.seek(0)
+            st.download_button(
+                "⬇️ Download all extracted .md files (ZIP)",
+                data=_zip_buf.getvalue(),
+                file_name=f"{(nse_symbol or 'extracted')}_md_extraction.zip",
+                mime="application/zip",
+                type="primary", use_container_width=True,
+            )
+        except Exception as _err:
+            st.error(f"Extraction failed: {_err}")
+            with st.expander("Error details"):
+                st.code(_tb.format_exc())
 
 
 # ── Main pipeline ──────────────────────────────────────────════════════════════

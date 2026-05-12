@@ -3,7 +3,17 @@ __pycache__/
 *.xlsx
 *.pdf
 *.csv
+*.md
+*.json
+*.html
+output/
+debug/
 venv/
+.venv/
+.env
 .git_old/
+.DS_Store
+.vscode/
+.idea/
 config/companies/generic.yaml
 config/companies/piramal.yaml
