@@ -20,6 +20,7 @@ Output sheet names: "<short_pdf_id> - <Scope> <Statement>" e.g.
 from __future__ import annotations
 
 import logging
+import os
 import re
 import time
 from dataclasses import dataclass, field
